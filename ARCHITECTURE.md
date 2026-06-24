@@ -271,6 +271,51 @@ The structure is many-producer, single-consumer:
   `atom_last_valid_key`, which producers raise and the walk reads through
   `check` (`stash.h:85`).
 
+## Tracing as an injectable extension point
+
+`stash.h` is instrumented throughout — every insert, walk iteration, hit, clear,
+and break emits a trace line — but it carries none of the machinery to render
+one. All of it flows through four hooks, and all four are no-ops by default:
+
+- `L_STASH(fmt, args...)` — the main trace macro, fired on the insert and walk
+  paths.
+- `L_DEBUG_HOOK(label, fmt, args...)` — the per-iteration loop trace, with a
+  label as its first argument (`stash.h:270`, `stash.h:410`).
+- `L_EXC(msg)` — used once, to swallow exceptions in the manual destructor
+  (`stash.h:160`).
+- `STASH_OP_COLOR(op)` — a color hook that maps a `StashContext::Operation` to a
+  C string (an ANSI escape). `StashContext::_col()` returns it (`stash.h:117`)
+  and the trace strings prepend it to tint a line per operation.
+
+The defaults live in `stash_trace.h`, and `stash.h` reaches them through a
+conditional include (`stash.h:34`):
+
+```cpp
+#ifdef STASH_TRACE_HEADER
+#  include STASH_TRACE_HEADER     // a consumer's header, e.g. Xapiand's
+#else
+#  include "stash_trace.h"        // the bundled no-op defaults
+#endif
+```
+
+So a consumer points `STASH_TRACE_HEADER` at its own header (or defines the
+macros before including `stash.h`) and gets real, colored, formatted tracing
+back; otherwise the no-ops compile the instrumentation away to nothing. Every
+hook in `stash_trace.h` is `#ifndef`-guarded, so overriding a subset is fine —
+the rest fall back to the defaults. This is a small, deliberate extension point,
+not a general logging framework: four named hooks, all optional.
+
+The trace strings themselves build color in by concatenation, for example
+`"StashSlots::" + CYAN + "LOOP" + CLEAR_COLOR` (`stash.h:270`). The color tokens
+(`CYAN`, `CLEAR_COLOR`, `FOREST_GREEN`, ...) appear only inside the arguments of
+the trace macros. When those macros are the default no-ops, the arguments are
+never evaluated, so the tokens cost nothing and need not exist at all — there is
+no `CYAN` symbol anywhere in the default build. They only have to be defined when
+a consumer enables tracing, and the consumer's trace header is exactly where they
+get defined (see `examples/colored_trace/trace.h`). That is what lets `stash.h`
+keep its colored Xapiand-style trace lines verbatim while depending on no color
+header at all.
+
 ## Complexity
 
 For a wheel of `L` nested slot levels:
@@ -341,14 +386,14 @@ For a wheel of `L` nested slot levels:
 ## Standalone vs. Xapiand
 
 This repository is a standalone extraction of `stash.h` from
-[Xapiand](https://github.com/Kronuz/Xapiand). Two changes were made to cut
-external dependencies:
-
-- `#include "log.h"` was replaced by a local `stash_trace.h` (`stash.h:29`) that
-  defines empty `L_*` trace macros (`stash_trace.h`). Define your own before
-  including `stash.h` to plug in real tracing.
-- `StashContext::_col()` (`stash.h:107`), the debug-only per-op ANSI color
-  helper, now returns `""` to drop the color dependency.
+[Xapiand](https://github.com/Kronuz/Xapiand). The dependency on Xapiand's
+`log.h` and color palette was cut by routing all tracing through the injectable
+hooks described above (see "Tracing as an injectable extension point"):
+`#include "log.h"` became the conditional include of a trace header
+(`stash.h:34`), defaulting to the no-op `stash_trace.h`, and `_col()` resolves
+through `STASH_OP_COLOR`, which is `""` by default (`stash.h:117`). The colored,
+formatted tracing Xapiand uses is fully recoverable by injecting a trace header,
+as `examples/colored_trace/` shows.
 
 The data-structure logic is otherwise unchanged. For the full timer-wheel /
 scheduler design, see

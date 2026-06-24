@@ -8,13 +8,14 @@ traps that are easy to fall into.
 ## Repo map
 
 ```
-stash.h            The library. Three templates plus StashContext. Header-only.
-stash_trace.h      No-op L_* trace macro stubs (stands in for Xapiand's log.h).
-test/test.cc       Runnable smoke test: a single-level wheel over a leaf.
-CMakeLists.txt     INTERFACE library target `stash` + CTest test `stash`.
-LICENSE            MIT, Copyright (c) 2015-2019 Dubalu LLC.
-README.md          What it is, install, usage, API reference, caveats.
-ARCHITECTURE.md    Internal design, concurrency model, trade-offs.
+stash.h                       The library. Three templates plus StashContext. Header-only.
+stash_trace.h                 No-op default tracing/coloring hooks (stands in for Xapiand's log.h).
+test/test.cc                  Runnable smoke test: a single-level wheel over a leaf.
+examples/colored_trace/       A runnable trace-header injection example (trace.h + main.cc).
+CMakeLists.txt                INTERFACE library target `stash` + CTest test `stash`.
+LICENSE                       MIT, Copyright (c) 2015-2019 Dubalu LLC.
+README.md                     What it is, install, usage, API reference, caveats.
+ARCHITECTURE.md               Internal design, concurrency model, trade-offs.
 ```
 
 Everything ships in `stash.h`. There is no `.cc` to compile except the test.
@@ -45,12 +46,22 @@ only adds the include directory and requests `cxx_std_17`. The test target is
   `compare_exchange` / `exchange` / fetch-add. Do not introduce mutexes,
   condition variables, or any blocking primitive.
 - **No external dependencies.** The only includes are `<array>`, `<atomic>`,
-  `<cassert>`, and the local `stash_trace.h` (`stash.h:25`). Do not add new
-  third-party or Xapiand headers.
-- **Tracing is opt-in.** Code may call `L_STASH`, `L_DEBUG_HOOK`, `L_EXC`, etc.
-  These resolve to no-ops via `stash_trace.h` unless the consumer defines them
-  first. Keep new trace calls behind the same macros; never assume they do
-  anything.
+  `<cassert>`, and the trace header (`stash.h:34`), which defaults to the local
+  `stash_trace.h`. Do not add new third-party or Xapiand headers, and do not pull
+  a logging or color header into `stash.h` directly — that is what the hooks are
+  for.
+- **Tracing flows through four injectable hooks**, all no-ops by default:
+  `L_STASH`, `L_DEBUG_HOOK` (label-first), `L_EXC`, and the color hook
+  `STASH_OP_COLOR(op)`. The defaults live in `stash_trace.h`, each
+  `#ifndef`-guarded so a consumer can override any subset. `stash.h` reaches them
+  through `#ifdef STASH_TRACE_HEADER` (`stash.h:34`): a consumer injects its own
+  header via `-DSTASH_TRACE_HEADER='"my_trace.h"'`, or defines the macros before
+  including `stash.h`. Keep new trace calls behind these macros; never assume they
+  do anything. `STASH_OP_COLOR` must return a pointer (a string literal or a
+  function-local static will do) that stays valid for the duration of the trace
+  call. Color tokens like `CYAN`/`CLEAR_COLOR` live only inside the no-op macro
+  arguments, so they need not exist in the default build — do not reference them
+  outside a trace call.
 - Double quotes in code; no em dashes in prose.
 
 ## Load-bearing invariants
@@ -95,9 +106,12 @@ produce silent data loss or a race, not a compile error.
 - **Change the value type.** Any pointer-like, bool-testable, dereferenceable
   type works (`std::shared_ptr<T>` is the reference choice). Verify the walk's
   `*ptr && **ptr` test means what you intend for the new type.
-- **Plug in tracing.** Define `L_STASH`, `L_DEBUG_HOOK`, `L_EXC`, and the color
-  symbols the trace strings reference before including `stash.h`, instead of
-  letting `stash_trace.h` stub them out.
+- **Plug in tracing (e.g. when debugging).** Inject a trace header with
+  `-DSTASH_TRACE_HEADER='"my_trace.h"'`, or define `L_STASH`, `L_DEBUG_HOOK`,
+  `L_EXC`, `STASH_OP_COLOR`, and the color symbols the trace strings reference
+  before including `stash.h`, instead of letting `stash_trace.h` stub them out.
+  `examples/colored_trace/` is a working reference: build it with
+  `c++ -std=c++20 -I. -I../.. -DSTASH_TRACE_HEADER='"trace.h"' main.cc -o demo`.
 - **Always extend the smoke test.** `test/test.cc` is the only executable check
   in the repo. Any behavioral change should grow a corresponding assertion
   there.
@@ -125,11 +139,13 @@ produce silent data loss or a race, not a compile error.
 ## Standalone vs. Xapiand
 
 This is a standalone extraction of `stash.h` from
-[Xapiand](https://github.com/Kronuz/Xapiand). Two deltas from the original:
-`#include "log.h"` became the local `stash_trace.h` (`stash.h:29`), and
-`StashContext::_col()` now returns `""` to drop the ANSI-color dependency
-(`stash.h:107`). The data-structure logic is otherwise identical. Keep changes
-that are pure extraction hygiene clearly separated from changes to the algorithm
-so they can be reconciled with upstream. For the scheduler design this powers,
-see
+[Xapiand](https://github.com/Kronuz/Xapiand). The delta from the original is that
+the dependency on Xapiand's `log.h` and color palette was replaced by the
+injectable trace hooks: `#include "log.h"` became a conditional include defaulting
+to the no-op `stash_trace.h` (`stash.h:34`), and `_col()` resolves through
+`STASH_OP_COLOR` (`stash.h:117`). The data-structure logic is otherwise identical,
+and the colored tracing is fully recoverable by injecting a trace header (see
+`examples/colored_trace/`). Keep changes that are pure extraction hygiene clearly
+separated from changes to the algorithm so they can be reconciled with upstream.
+For the scheduler design this powers, see
 [Xapiand's SCHEDULER.md](https://github.com/Kronuz/Xapiand/blob/master/SCHEDULER.md).

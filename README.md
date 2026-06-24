@@ -169,6 +169,42 @@ The append-only leaf level (`stash.h:371`).
   clean), returns the first non-empty pointer-like value, and consumes it
   unless the op is `peep` (`stash.h:391`).
 
+## Tracing and colors
+
+`stash.h` does not hard-code its own tracing. It instruments itself through four
+hooks that are no-ops by default, so out of the box the data structure builds
+with zero dependency on any logging or color header and tracing costs nothing at
+runtime:
+
+- `L_STASH(fmt, args...)` — the main trace macro on the insert and walk paths.
+- `L_DEBUG_HOOK(label, fmt, args...)` — per-iteration loop trace; takes a label
+  as its first argument.
+- `L_EXC(msg)` — used to swallow exceptions in the manual destructor.
+- `STASH_OP_COLOR(op)` — returns a C string (an ANSI escape) used to tint a
+  trace line per `StashContext::Operation`. `StashContext::_col()` returns this
+  (`stash.h:117`). It is `""` by default.
+
+The bundled `stash_trace.h` supplies the no-op defaults, each one
+`#ifndef`-guarded so you can override any subset and let the rest fall back.
+There are two ways to plug in real tracing:
+
+1. Point `STASH_TRACE_HEADER` at a header that defines the hooks. `stash.h`
+   includes it in place of `stash_trace.h` (`stash.h:34`):
+
+   ```sh
+   c++ -std=c++20 -DSTASH_TRACE_HEADER='"my_trace.h"' ...
+   ```
+
+2. Define the macros directly before including `stash.h`.
+
+Nothing is required by default. A complete, runnable override lives in
+[`examples/colored_trace/`](examples/colored_trace/): it defines the color
+constants, `STASH_OP_COLOR`, and the `L_*` macros, rendering with `std::format`
+to produce colored, fully-formatted trace lines. That example needs C++20 for
+`std::format` / `std::vformat`, even though `stash.h` itself only requires C++17.
+It is how a consumer such as Xapiand recovers the colored debug tracing it relies
+on without editing `stash.h`.
+
 ## Build & test
 
 Header-only (`stash.h` plus `stash_trace.h`, a tiny set of no-op trace stubs).
@@ -189,11 +225,6 @@ The test prints `stash OK: walked 3 values in key order: 11 22 33` and exits 0.
 - **Single-consumer walk.** Many producers can `add`/`put` concurrently, but
   the walk/peep/clean side mutates non-atomic cursors (`walk_cur`,
   `clean_cur`) and is not safe for concurrent walkers.
-- **Standalone changes from the Xapiand original:** the `#include "log.h"` was
-  replaced by a local `stash_trace.h` that defines empty `L_*` trace macros
-  (define your own before including `stash.h` to plug in tracing), and the
-  debug-only color helper `StashContext::_col()` now returns `""` to drop the
-  ANSI-color dependency (`stash.h:107`).
 - **Vestigial template parameters:** `CurrentKey` (the `&now` function pointer)
   and `Ring` are declared but unused in the bodies. They are kept for
   source-compatibility with the original and can be dropped in a future

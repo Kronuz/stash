@@ -26,7 +26,16 @@
 #include <atomic>                // for std::atomic
 #include <cassert>               // for assert
 
-#include "stash_trace.h"         // no-op trace stubs (replaces Xapiand's log.h)
+// Tracing and coloring are optional and fully injectable. Define
+// STASH_TRACE_HEADER (a header path) before including this file to plug in your
+// own logging macros (L_STASH / L_DEBUG_HOOK / L_EXC) and per-operation colors
+// (STASH_OP_COLOR); otherwise the bundled no-op stubs are used. See
+// stash_trace.h and examples/colored_trace/ for a working override.
+#ifdef STASH_TRACE_HEADER
+#  include STASH_TRACE_HEADER
+#else
+#  include "stash_trace.h"
+#endif
 
 
 // #define L_STASH L_COLLECT
@@ -102,10 +111,11 @@ struct StashContext {
 		}
 	}
 
-	// Per-op color used only by the (no-op by default) trace macros. Standalone
-	// build drops the ANSI color dependency and returns an empty string.
+	// Per-operation color for trace lines. Resolved through the STASH_OP_COLOR
+	// hook, which is "" by default (no color) and overridable by a trace header
+	// to restore colored output. Only ever called from the trace macros.
 	const char* _col() const noexcept {
-		return "";
+		return STASH_OP_COLOR(op);
 	}
 };
 

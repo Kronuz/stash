@@ -25,6 +25,7 @@
 #include <array>                 // for std::array
 #include <atomic>                // for std::atomic
 #include <cassert>               // for assert
+#include <limits>                // for std::numeric_limits
 
 // Tracing and coloring are optional and fully injectable. Define
 // STASH_TRACE_HEADER (a header path) before including this file to plug in your
@@ -240,11 +241,32 @@ class StashSlots : public Stash<_Tp, _Size> {
 	}
 
 	unsigned long long get_dec_base_key(unsigned long long key) const {
-		return get_base_key(key) - _Div;
+		// Start of the previous slot. Guard against unsigned underflow at the
+		// low end of the key space: there is no slot below 0, so floor at 0
+		// instead of wrapping to ~2^64. The wrapped value would otherwise be
+		// published into atom_first_valid_key by the CAS loop in next() and
+		// corrupt the bound.
+		auto base_key = get_base_key(key);
+		if (base_key < _Div) {
+			return 0;
+		}
+		return base_key - _Div;
 	}
 
 	unsigned long long get_end_base_key(unsigned long long key) const {
-		return get_base_key(key) + (_Div * _Mod);
+		// One wheel span past the slot's base, used as the overflow horizon.
+		// Guard against unsigned overflow for clock-derived keys high in the
+		// 64-bit range: if base_key + span would wrap past the max value, the
+		// horizon is effectively unbounded, so saturate at the max instead of
+		// wrapping to a small value (which would make the overflow guard reject
+		// valid keys or accept invalid ones).
+		constexpr auto max_key = std::numeric_limits<unsigned long long>::max();
+		constexpr auto span = _Div * _Mod;
+		auto base_key = get_base_key(key);
+		if (base_key > max_key - span) {
+			return max_key;
+		}
+		return base_key + span;
 	}
 
 	size_t get_slot(unsigned long long key) const {

@@ -45,11 +45,11 @@ using TaskPtr = std::shared_ptr<Task>;
 
 // ---- stash wheel, Xapiand's exact config -----------------------------------
 struct StashWheel {
-	using Tasks = StashValues<TaskPtr, 10ULL, &now_ns>;
-	using L1 = StashSlots<Tasks, 10ULL, &now_ns, 1ULL * MS, 50ULL, false>;
-	using L2 = StashSlots<L1, 10ULL, &now_ns, 50ULL * MS, 10ULL, false>;
-	using L3 = StashSlots<L2, 12ULL, &now_ns, 500ULL * MS, 36ULL, false>;
-	using Wheel = StashSlots<L3, 4800ULL, &now_ns, 18000ULL * MS, 4800ULL, true>;
+	using Tasks = StashValues<TaskPtr, 10ULL>;
+	using L1 = StashSlots<Tasks, 10ULL, 1ULL * MS, 50ULL>;
+	using L2 = StashSlots<L1, 10ULL, 50ULL * MS, 10ULL>;
+	using L3 = StashSlots<L2, 12ULL, 500ULL * MS, 36ULL>;
+	using Wheel = StashSlots<L3, 4800ULL, 18000ULL * MS, 4800ULL>;
 	StashContext ctx;
 	Wheel queue;
 	StashWheel() : ctx(now_ns()) {}

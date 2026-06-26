@@ -20,12 +20,12 @@ Three composable templates build up from a primitive to a full keyed wheel:
   `std::atomic<T*>`. Slots beyond `Size` spill into a linked `Data` node;
   chunks and nodes are published with `compare_exchange`, so concurrent
   producers never block (`stash.h:154`).
-- **`StashSlots<T, Size, CurrentKey, Div, Mod, Ring>`** — a keyed level: a key
+- **`StashSlots<T, Size, Div, Mod>`** — a keyed level: a key
   maps to slot `(key / Div) % Mod` (`stash.h:240`), and `T` is itself a
   `Stash`, so levels **nest** to give multiple time resolutions. `next()`
   walks a key window in one of three modes — walk (consume), peep (look-ahead),
   clean (GC).
-- **`StashValues<T, Size, CurrentKey>`** — the leaf: an append-only list with
+- **`StashValues<T, Size>`** — the leaf: an append-only list with
   an atomic write cursor (`atom_end`) and separate walk/clean read cursors
   (`stash.h:375`).
 
@@ -81,12 +81,9 @@ that keys by a clock. A minimal single-level wheel, taken from `test/test.cc`:
 ```cpp
 #include "stash.h"
 
-// Deterministic key source (the vestigial _CurrentKey template parameter).
-static unsigned long long now() { return 0; }
-
 using Item  = std::shared_ptr<int>;              // values must be pointer-like
-using Leaf  = StashValues<Item, 4, &now>;
-using Wheel = StashSlots<Leaf, 8, &now, /*Div*/1, /*Mod*/8, /*Ring*/true>;
+using Leaf  = StashValues<Item, 4>;
+using Wheel = StashSlots<Leaf, 8, /*Div*/1, /*Mod*/8>;
 
 Wheel wheel;
 StashContext ctx(0ULL);   // op=walk, begin/end/first/last = 0
@@ -144,7 +141,7 @@ The chunked atomic-pointer array primitive (`stash.h:113`).
   nodes via CAS; with `spawn == false` it reports `StashEmpty`, `ChunkEmpty`,
   or `StashShort` instead of allocating (`stash.h:209`).
 
-### `StashSlots<T, Size, CurrentKey, Div, Mod, Ring>`
+### `StashSlots<T, Size, Div, Mod>`
 
 A keyed level over a `Stash` whose element type `T` is itself a `Stash`
 (another `StashSlots` or a `StashValues`) (`stash.h:220`).
@@ -158,7 +155,7 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
   recursing into the child level, returning the first matching value
   (`stash.h:250`).
 
-### `StashValues<T, Size, CurrentKey>`
+### `StashValues<T, Size>`
 
 The append-only leaf level (`stash.h:371`).
 
@@ -225,10 +222,6 @@ The test prints `stash OK: walked 3 values in key order: 11 22 33` and exits 0.
 - **Single-consumer walk.** Many producers can `add`/`put` concurrently, but
   the walk/peep/clean side mutates non-atomic cursors (`walk_cur`,
   `clean_cur`) and is not safe for concurrent walkers.
-- **Vestigial template parameters:** `CurrentKey` (the `&now` function pointer)
-  and `Ring` are declared but unused in the bodies. They are kept for
-  source-compatibility with the original and can be dropped in a future
-  cleanup.
 
 ## Provenance
 

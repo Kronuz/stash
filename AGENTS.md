@@ -132,9 +132,6 @@ produce silent data loss or a race, not a compile error.
 - **The destructor is manual and not concurrency-safe.** `Data::~Data`
   (`stash.h:130`) hand-walks and frees the node chain and chunk. Do not destroy
   a structure while a walker or producer is touching it.
-- **`_CurrentKey` and `_Ring` are vestigial.** They are declared but unused in
-  the bodies. Do not write code that assumes they do anything; if you wire them
-  up, that is a real behavior change to call out.
 
 ## Standalone vs. Xapiand
 

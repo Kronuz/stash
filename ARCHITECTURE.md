@@ -16,10 +16,10 @@ The design is three templates layered on top of each other:
 
 1. `Stash<T, Size>` — the primitive. A chunked array of `std::atomic<T*>` that
    grows lazily and never blocks producers.
-2. `StashSlots<T, Size, CurrentKey, Div, Mod, Ring>` — a keyed level built on a
+2. `StashSlots<T, Size, Div, Mod>` — a keyed level built on a
    `Stash`. Maps a key to a slot, and because its element type `T` is itself a
    `Stash`, levels nest to form a multi-resolution wheel.
-3. `StashValues<T, Size, CurrentKey>` — the leaf, also built on a `Stash`. An
+3. `StashValues<T, Size>` — the leaf, also built on a `Stash`. An
    append-only list of values with a write cursor and read cursors.
 
 A concrete wheel is a type like
@@ -93,7 +93,7 @@ installed.
 
 ## The keyed level: `StashSlots`
 
-`StashSlots<_Tp, _Size, _CurrentKey, _Div, _Mod, _Ring>` (`stash.h:220`) derives
+`StashSlots<_Tp, _Size, _Div, _Mod>` (`stash.h:220`) derives
 from `Stash<_Tp, _Size>`, so it has the chunked array underneath. Its job is to
 turn a key into a slot index and recurse into the child level stored there.
 
@@ -139,7 +139,7 @@ let the walk skip empty key ranges.
 
 ## The leaf: `StashValues`
 
-`StashValues<_Tp, _Size, _CurrentKey>` (`stash.h:371`) also derives from
+`StashValues<_Tp, _Size>` (`stash.h:371`) also derives from
 `Stash<_Tp, _Size>`, but it ignores the key entirely. It is an append-only log.
 
 It adds three cursors (`stash.h:375`):
@@ -341,7 +341,7 @@ For a wheel of `L` nested slot levels:
   capacity up front. The `Size`-chunk-plus-linked-node layout lets a level grow
   past `Size` without reallocating or copying, and untouched ranges stay
   unallocated.
-- **CurrentKey-driven keys, not wall clock.** The key is an abstract unsigned
+- **Caller-supplied keys, not wall clock.** The key is an abstract unsigned
   integer supplied by the caller, so the same structure works for a real
   millisecond clock, a logical tick, or a test's deterministic counter.
 - **Three ops over one traversal.** Folding walk/peep/clean into a single
@@ -366,15 +366,10 @@ For a wheel of `L` nested slot levels:
   more than one wheel span past `atom_first_valid_key` (`stash.h:356`). The
   caller (a scheduler) is expected to keep keys within the live window by
   draining the wheel as the clock advances.
-- **Vestigial parameters.** `_CurrentKey` and `_Ring` are declared on the
-  templates but unused in the bodies. They are kept for source-compatibility
-  with the Xapiand original. A `_Ring` wheel (one that wraps the key space
-  instead of overflowing) was evidently intended but is not implemented here.
 
 ## Possible improvements
 
-- Drop the unused `_CurrentKey` and `_Ring` template parameters, or finish the
-  ring-buffer behavior `_Ring` implies so the wheel can wrap instead of throwing
+- Add a ring-buffer mode so the wheel can wrap the key space instead of throwing
   on overflow.
 - Replace the hand-rolled `Data::~Data` teardown with RAII-owning node/chunk
   types so destruction is harder to get wrong.

@@ -10,14 +10,12 @@
 
 #include "stash.h"
 
-static unsigned long long now() { return 0; }
-
 int main() {
 	std::puts("=== stash with a colored trace header injected ===");
 
 	using Item = std::shared_ptr<int>;
-	using Leaf = StashValues<Item, 4, &now>;
-	using Wheel = StashSlots<Leaf, 8, &now, /*Div*/1, /*Mod*/8, /*Ring*/true>;
+	using Leaf = StashValues<Item, 4>;
+	using Wheel = StashSlots<Leaf, 8, /*Div*/1, /*Mod*/8>;
 
 	Wheel wheel;
 	StashContext ctx(0ULL);

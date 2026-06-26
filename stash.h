@@ -228,7 +228,7 @@ public:
 };
 
 
-template <typename _Tp, size_t _Size, unsigned long long(*_CurrentKey)(), unsigned long long _Div, unsigned long long _Mod, bool _Ring>
+template <typename _Tp, size_t _Size, unsigned long long _Div, unsigned long long _Mod>
 class StashSlots : public Stash<_Tp, _Size> {
 	using Stash_T = Stash<_Tp, _Size>;
 
@@ -400,7 +400,7 @@ public:
 };
 
 
-template <typename _Tp, size_t _Size, unsigned long long(*_CurrentKey)()>
+template <typename _Tp, size_t _Size>
 class StashValues : public Stash<_Tp, _Size> {
 	using Stash_T = Stash<_Tp, _Size>;
 

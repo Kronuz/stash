@@ -20,13 +20,10 @@
 #include <vector>
 #include "stash.h"
 
-// Deterministic key source (the vestigial _CurrentKey template parameter).
-static unsigned long long now() { return 0; }
-
 // The smoke test types: a single keyed level (Div=1, Mod=8) over a leaf.
 using Item  = std::shared_ptr<int>;
-using Leaf  = StashValues<Item, 4, &now>;
-using Wheel = StashSlots<Leaf, 8, &now, /*Div*/1, /*Mod*/8, /*Ring*/true>;
+using Leaf  = StashValues<Item, 4>;
+using Wheel = StashSlots<Leaf, 8, /*Div*/1, /*Mod*/8>;
 
 // Original smoke test: insert at small keys, walk in order, consume.
 static void test_smoke() {

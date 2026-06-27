@@ -424,25 +424,29 @@ class StashValues : public Stash<_Tp, _Size> {
 
 	size_t walk_cur;
 	size_t clean_cur;
-	std::atomic_size_t atom_end;
+	std::atomic_size_t atom_end;     // producer reserve frontier (next slot to claim)
+	std::atomic_size_t atom_ready;   // contiguous written frontier (<= atom_end);
+	                                 // slots [0, atom_ready) are guaranteed written
 
 public:
 	StashValues(StashValues&& o) noexcept
 		: Stash_T::Stash(std::move(o)),
 		  walk_cur(std::move(o.walk_cur)),
 		  clean_cur(std::move(o.clean_cur)),
-		  atom_end(o.atom_end.load()) { }
+		  atom_end(o.atom_end.load()),
+		  atom_ready(o.atom_ready.load()) { }
 
 	StashValues()
 		: walk_cur(0),
 		  clean_cur(0),
-		  atom_end(0) { }
+		  atom_end(0),
+		  atom_ready(0) { }
 
 	template <typename T>
 	bool next(StashContext& ctx, T* value_ptr, unsigned long long) {
 		auto cur = (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur;
 
-		auto loop = cur < ((ctx.op == StashContext::Operation::clean) ? walk_cur : atom_end.load());
+		auto loop = cur < ((ctx.op == StashContext::Operation::clean) ? walk_cur : atom_ready.load());
 
 		while (loop) {
 			auto new_cur = cur + 1;
@@ -462,7 +466,7 @@ public:
 					return false;
 			}
 
-			loop = new_cur < ((ctx.op == StashContext::Operation::clean) ? walk_cur : atom_end.load());
+			loop = new_cur < ((ctx.op == StashContext::Operation::clean) ? walk_cur : atom_ready.load());
 
 			if (loop) {
 				switch (ctx.op) {
@@ -524,6 +528,28 @@ public:
 			if (atom_ptr.compare_exchange_strong(ptr, tmp.get())) {
 				ptr = tmp.release();
 			}  // else: unique_ptr frees the loser (exception-safe)
+		}
+
+		// COMMIT: advance atom_ready over the contiguous *written* prefix, but only
+		// up to the reserve frontier observed *now*. Snapshotting atom_end bounds
+		// the loop -- re-reading it each iteration lets one producer chase an
+		// ever-growing reserve count under load and never terminate (a livelock).
+		// Whoever fills the slot that closes a gap drags the frontier past every
+		// slot already written behind it; a hole stops the advance until its own
+		// producer fills it (out-of-order fills handled exactly). Slots reserved
+		// after this snapshot are advanced by their own producers' COMMIT passes.
+		auto end = atom_end.load(std::memory_order_acquire);
+		auto r = atom_ready.load(std::memory_order_acquire);
+		while (r < end) {
+			std::atomic<_Tp*>* rp = nullptr;
+			if (Stash_T::get(&rp, r, false) != StashState::Ok ||
+			    !rp || !rp->load(std::memory_order_acquire)) {
+				break;   // slot r not written yet (a hole); its producer will advance it
+			}
+			if (atom_ready.compare_exchange_weak(r, r + 1,
+			        std::memory_order_acq_rel, std::memory_order_acquire)) {
+				++r;
+			}  // else: r reloaded to the current frontier; retry (still < end)
 		}
 	}
 };

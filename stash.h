@@ -145,6 +145,17 @@ struct StashContext {
 template <typename _Tp, size_t _Size>
 class Stash {
 protected:
+	class Data;
+
+	// Sequential-access cursor: a single consumer reading slots in order can resume
+	// the chain walk from the node it last resolved instead of re-walking from the
+	// head every call. Consumer-private (never shared with producers); a leaf's
+	// chain only grows during its life, so the cached node is never freed under it.
+	struct Cursor {
+		Data* node = nullptr;   // chunk node covering [base, base + _Size)
+		size_t base = 0;        // first slot index of that node's chunk
+	};
+
 	class Data {
 		using Chunks = std::array<std::atomic<_Tp*>, _Size>;
 		std::atomic<Chunks*> atom_chunk;
@@ -183,30 +194,46 @@ protected:
 			}
 		}
 
-		StashState get(std::atomic<_Tp*>** pptr_atom_ptr, size_t slot, bool spawn) {
+		StashState get(std::atomic<_Tp*>** pptr_atom_ptr, size_t slot, bool spawn,
+		               Cursor* cursor = nullptr) {
 			if (!spawn && !atom_next && !atom_chunk) {
 				return StashState::StashEmpty;
 			}
 
-			auto _data = this;
-			if (slot >= _Size) {
-				size_t chunk_num = slot / _Size;
-				slot = slot % _Size;
+			size_t chunk_num = slot / _Size;
+			size_t local = slot % _Size;
 
-				for (size_t c = 0; c < chunk_num; ++c) {
-					auto next = _data->atom_next.load();
-					if (!next) {
-						if (!spawn) {
-							return StashState::StashShort;
-						}
-						auto tmp = std::make_unique<Data>();
-						if (_data->atom_next.compare_exchange_strong(next, tmp.get())) {
-							next = tmp.release();
-						}  // else: unique_ptr frees the loser (exception-safe)
-					}
-					_data = next;
-				}
+			// Walk the chain to the chunk holding `slot`. A single consumer reading
+			// slots in order would otherwise re-walk from the head every call
+			// (O(slot/_Size)); a cursor lets it resume from the last node it
+			// resolved, making sequential access O(1) amortized. The cursor is only
+			// usable when it sits at or before the target chunk (a backward access,
+			// or none, starts from the head). It is consumer-private -- never shared
+			// with producers -- and a leaf's chain only grows during its life, so the
+			// cached node is never freed while the cursor holds it.
+			auto _data = this;
+			size_t c = 0;
+			if (cursor && cursor->node && cursor->base / _Size <= chunk_num) {
+				_data = cursor->node;
+				c = cursor->base / _Size;
 			}
+
+			for (; c < chunk_num; ++c) {
+				auto next = _data->atom_next.load();
+				if (!next) {
+					if (!spawn) {
+						if (cursor) { cursor->node = _data; cursor->base = c * _Size; }
+						return StashState::StashShort;
+					}
+					auto tmp = std::make_unique<Data>();
+					if (_data->atom_next.compare_exchange_strong(next, tmp.get())) {
+						next = tmp.release();
+					}  // else: unique_ptr frees the loser (exception-safe)
+				}
+				_data = next;
+			}
+
+			if (cursor) { cursor->node = _data; cursor->base = chunk_num * _Size; }
 
 			auto chunk = _data->atom_chunk.load();
 			if (!chunk) {
@@ -219,7 +246,7 @@ protected:
 				}  // else: unique_ptr frees the loser (exception-safe)
 			}
 
-			auto& atom_ptr = (*chunk)[slot];
+			auto& atom_ptr = (*chunk)[local];
 
 			*pptr_atom_ptr = &atom_ptr;
 			return StashState::Ok;
@@ -241,6 +268,13 @@ public:
 		 *   StashState::StashShort
 		 */
 		return data.get(pptr_atom_ptr, slot, spawn);
+	}
+
+protected:
+	// Cursor-aware get: a single consumer scanning slots in order passes its own
+	// Cursor so the chain walk resumes instead of restarting from the head.
+	StashState get(std::atomic<_Tp*>** pptr_atom_ptr, size_t slot, bool spawn, Cursor& cursor) {
+		return data.get(pptr_atom_ptr, slot, spawn, &cursor);
 	}
 };
 
@@ -449,6 +483,8 @@ class StashValues : public Stash<_Tp, _Size> {
 	std::atomic_size_t atom_end;     // producer reserve frontier (next slot to claim)
 	std::atomic_size_t atom_ready;   // contiguous written frontier (<= atom_end);
 	                                 // slots [0, atom_ready) are guaranteed written
+	typename Stash_T::Cursor walk_cursor;    // consumer scan resume points (single
+	typename Stash_T::Cursor clean_cursor;   // consumer; each tracks its own cur)
 
 public:
 	StashValues(StashValues&& o) noexcept
@@ -468,6 +504,13 @@ public:
 	bool next(StashContext& ctx, T* value_ptr, unsigned long long) {
 		auto cur = (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur;
 
+		// Resume the chain walk from this op's cursor. peep is read-only lookahead
+		// and must not perturb the persistent walk cursor, so it uses a throwaway.
+		typename Stash_T::Cursor peep_cursor;
+		auto& cursor = (ctx.op == StashContext::Operation::walk)  ? walk_cursor
+		             : (ctx.op == StashContext::Operation::clean) ? clean_cursor
+		             :                                              peep_cursor;
+
 		auto loop = cur < ((ctx.op == StashContext::Operation::clean) ? walk_cur : atom_ready.load());
 
 		while (loop) {
@@ -476,7 +519,7 @@ public:
 			L_DEBUG_HOOK("StashValues::LOOP", "StashValues::" + LIGHT_SKY_BLUE + "LOOP" + CLEAR_COLOR + " - {}cur:{}, cur:{}, atom_end:{}, op:{}", ctx._col(), cur, (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur, atom_end.load(), ctx._op());
 
 			std::atomic<_Tp*>* ptr_atom_ptr = nullptr;
-			switch (Stash_T::get(&ptr_atom_ptr, cur, false)) {
+			switch (Stash_T::get(&ptr_atom_ptr, cur, false, cursor)) {
 				case StashState::Ok:
 					break;
 				case StashState::ChunkEmpty:

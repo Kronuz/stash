@@ -239,28 +239,52 @@ The leaf strand is closed (Step 1 at threads ≤ cores) and the head-of-line tai
 is recovered rather than dropped (Steps 2+3 under oversubscription). `test.cc`,
 `longevity.cc`, and the leak→plateau demo stay green.
 
-### What is *not* closed: the reclamation race with active clean
+### The active-clean loss was the wall-clock margin, and walk-based clean closes it
 
-Under oversubscription **with `clean` running at a finite margin**, both `main`
-and the fixed build still lose ~1500–3700 per 3 s run, roughly equally, and the
-loss does not shrink as the margin grows (64 ms → 1024 ms is flat and noisy).
-That is not the strand — `main` has no `atom_ready` yet loses the same. It is a
-reclamation race: `clean` frees a subtree while a *preempted* thread still holds
-a reference into it. A wall-clock margin cannot close this with certainty under
-arbitrary preemption (the whole reason certain reclamation needs SMR, not a
-timer). It is the R1/R2 boundary, documented as out of scope for this addition.
+With `clean` running at a finite margin, both `main` and the fixed build lost
+~1500–3700 per 3 s run under oversubscription, roughly equally, and the loss did
+not shrink as the margin grew (64 ms → 1024 ms, flat and noisy). That ruled out
+"margin too small for backlog." TSan then showed **zero data races**, and ASan /
+libgmalloc showed **no use-after-free** — so it was not a memory-safety race at
+all. It was algorithmic: `clean`'s cutoff is wall-clock `now - margin`, and under
+load that reclaims tasks that completed their `add` but went overdue before the
+single consumer fired them. The same loss is present in the bare base (b3794af),
+so it was never introduced by R1/R2/Steps.
 
-### Sanitizer status (host toolchain limitation)
+The fix is **walk-based clean**: reclaim up to the walk's live `first_valid`
+instead of `now - margin`. With the strand fix, `first_valid` is a safe boundary
+(pending leaves pin it, late inserts lower it), so everything below it is walked
+and untouched. This is the original "clean as walking", and it needs no SMR.
 
-ASan and TSan could not be run on this host: Apple clang 17 on macOS 26.5.1.
-ASan hangs during runtime init (`__asan::InitializeShadowMemory` spins iterating
-the dyld shared cache); TSan segfaults at thread creation — a 5-line
-`std::thread` program reproduces both, so it is the toolchain, not this code.
-The ASan/TSan rows of the proof gate must run on Linux/CI or a newer LLVM.
+| producers | margin clean | walk-based clean |
+|-----------|--------------|------------------|
+| 8         | 26           | **0** |
+| 12        | 31           | **0** |
+| 13        | 2264         | **0** |
+| 14        | 3771         | **0** |
+| 16        | ~3000        | **0** |
 
-As a substitute, `libgmalloc` (guard-page allocator, unmaps on free so any
-use-after-free faults immediately) ran the oversubscribed, clean-on config across
-~174k inserts with **no guard-page fault**. Combined with the no-UAF accounting
-above, this indicates the residual loss is dropped/detached subtrees (accounting)
-rather than writes into freed live memory — though it is weaker evidence than a
-clean TSan/ASan pass and does not replace one.
+Memory stays bounded (peak ~50–90 KB, no worse than the margin version). The only
+residual is the **descent window**: a task that becomes due in the window before
+its own insert publishes. It needs insert latency to exceed the task's lead time,
+so it cannot occur for any real schedule; at the extreme leading edge (≤8 ms lead)
+it is ~1 in millions plain, a handful under TSan's ~20× slowdown, and **0** as
+soon as the lead exceeds insert latency (verified: TSan, 16 ms lead, p=14 → 0 lost,
+0 races). We take it pure (no backstop margin); the precondition is documented.
+
+### Sanitizer status
+
+Apple clang 17 on macOS 26.5.1 cannot run the sanitizers (ASan hangs in dyld-cache
+init; TSan segfaults at thread create — a 5-line `std::thread` program reproduces
+both, so it is the toolchain). **Homebrew LLVM 22** works and is what the proof
+gate below uses.
+
+Proof gate (`test/concurrent.cc`, walk-based clean, 14-core host):
+
+- plain, leading edge (lead 0), p=8/14/16: 0 lost (10/10 repeats at p=14), memory bounded
+- ASan, leading edge, p=14 and p=16: no use-after-free, 0 lost
+- TSan, lead 16 ms, p=14: 0 data races, 0 lost
+
+The scheduler adopts the same one-line change (`clean` cutoff = `first_valid`,
+`pending_floor` reset per walk, R1 margin and R2 keep-out removed); its
+`test/test.cc` passes plain and under ASan.

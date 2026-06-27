@@ -226,62 +226,61 @@ three read-side operations, which must not run concurrently with each other:
 - **`peep`** is a read-only lookahead (find the soonest entry, e.g. to size a
   sleep). It advances no cursor and frees nothing.
 - **`clean`** reclaims *structure*: it drops a slot's whole subtree once that
-  slot's window is entirely behind a safe cutoff. **`clean` is required** — with
-  no `clean` the structure grows without bound (each reused leaf's append cursor
-  never resets). It is a separate pass, by design, because it may only release
-  what is provably past the consumer and unreachable by producers.
+  slot is entirely below `first_valid`, the walk's live low-water mark.
+  **`clean` is required** (without it the structure grows without bound, since
+  each reused leaf's append cursor never resets).
 
-Correctness rests on these invariants, all of which the Xapiand scheduler
-satisfies:
+`clean` is **walk-based** ("clean as walking"): its cutoff is `first_valid`, not
+a wall-clock time. That is safe because `first_valid` is a true reclamation
+boundary, held by two mechanisms in the insert/walk protocol:
+
+- A leaf with an in-flight insert (a slot reserved with `atom_end++` but not yet
+  written) reports itself *pending*, and the walk caps `first_valid` at that
+  leaf's key (`pending_floor`). The low-water mark never crosses a leaf a producer
+  is still filling.
+- A late insert (a key that has just gone past) lowers `first_valid` to its own
+  key, before the value is published, so `clean` cannot reclaim under it.
+
+Everything strictly below `first_valid` has therefore been walked and is touched
+by no producer, so its subtree drops with no locks, no checks, and no time margin.
+
+Correctness rests on:
 
 1. **One consumer.** A single thread runs `walk` then `clean` sequentially. Two
    walkers, or `clean` concurrent with `walk`, is undefined behavior.
-2. **Producers never write the past.** Keys are clamped to `>= now`, so no
-   producer targets a slot the consumer has passed — except transiently at a slot
-   boundary (a producer that latched a slot just before the clock crossed it).
-3. **`clean` trails by a margin longer than any in-flight `add`.** The cutoff
-   (`now - margin` in the scheduler) covers that boundary case: a slot a margin in
-   the past is being touched by no one, so its subtree is dropped with no locks or
-   checks.
-4. **No scheduling near the wrap horizon.** Keys stay below the wheel span; the
-   overflow guard drops anything beyond it. Scheduling within a margin of the full
-   horizon would alias a future write onto a slot being reclaimed.
+2. **The contiguous-frontier protocol.** `atom_ready` is the written frontier; the
+   walk reads up to it, never past a reserved-but-unwritten hole, and `pending_floor`
+   keeps reclamation from crossing a pending leaf. So the walk never skips a
+   reserved slot and `clean` never frees under an in-flight insert. (This is the
+   strand fix; see `STRAND_FIX.md`.)
+3. **Insert latency below task lead time.** The bound and the `first_valid`
+   lowering happen *during* `add`, so a task that becomes due in the brief window
+   *before* its insert publishes (the descent window) can be reclaimed before it
+   is visible. For any real schedule (leads of milliseconds and up against insert
+   latency of microseconds) this cannot happen; it surfaces only under a
+   sanitizer's slowdown driving inserts at a sub-millisecond leading edge.
 
-Inside this envelope — one consumer, bounded rates, a margin longer than an
-operation, no near-horizon scheduling — `stash` is correct, and that is exactly
-how the scheduler uses it. **Outside it, this is not a general-purpose MPMC
-structure.** A synthetic hammer (many producers at extreme rates, a margin shorter
-than an operation, or scheduling at the horizon) can expose a small rate of lost
-entries via a boundary use-after-free, near-horizon aliasing, or a bounds-ordering
-strand under heavy contention. Making reclamation *certain* under arbitrary
-concurrency needs real safe-memory-reclamation (epoch / hazard pointers) plus a
-linearized insert/walk — a planned redesign, not a property of the current
-margin-based `clean`.
+Inside this envelope (one consumer, insert latency below lead time) `stash`
+reclaims with **exact accounting and no time margin**: every entry fires exactly
+once, memory stays bounded, and there are no data races or use-after-free
+(ASan/TSan clean), including under thread oversubscription. `test/longevity.cc`
+demonstrates the reclamation (unbounded growth without `clean`, bounded with it);
+`test/concurrent.cc` proves the accounting under heavy producer/consumer
+contention.
 
-`test/longevity.cc` demonstrates the reclamation (unbounded growth without
-`clean`, bounded with it); `test/concurrent.cc` exercises the envelope under
-producer/consumer contention with ASan/TSan.
+This replaced an earlier **margin-based** `clean` (cutoff `now - margin`), which
+bought a wall-clock quiescence window for safety but, under load, reclaimed
+completed-but-overdue tasks. Walk-based `clean` removes both the loss and the
+margin, and the strand fix is what makes `first_valid` trustworthy enough to do so.
 
-### Hardening knobs
+### Optional: near-horizon scheduling (`horizon_margin`)
 
-Two of the three envelope dangers have cheap, exact fixes; the third (the
-bounds-ordering strand) does not, short of the planned redesign.
-
-- **R1 — boundary use-after-free.** Only possible if a producer stalls *longer
-  than the clean margin* mid-`add`. The clean cutoff (`now - margin`, the
-  consumer's choice) is the safety buffer: a bigger margin tolerates longer
-  stalls at the cost of holding more not-yet-reclaimed structure. The scheduler's
-  one-minute margin already makes this astronomically unlikely; raise it if you
-  must tolerate longer pauses. Not a code change here — it is the consumer's
-  `clean` cutoff.
-- **R2 — near-horizon aliasing.** Set `StashContext::horizon_margin` (default 0)
-  to a keep-out zone `>=` the clean margin: `add()` then rejects keys within that
-  much of the horizon, so a near-horizon insert can never alias onto a slot being
-  reclaimed one period below. The operational cost is that you can schedule up to
-  `span - horizon_margin` instead of the full `span` (e.g. ~24h minus a minute).
-- **The strand** has no cheap knob: it is the walk observing an insert mid-flight
-  (a leaf slot reserved with `atom_end++` but not yet written, or a bound bumped
-  after the value). Closing it needs a linearized insert/walk (the redesign).
+`StashContext::horizon_margin` (default 0, off) reserves a keep-out zone at the
+wrap horizon: `add()` rejects keys within that much of the span, so a near-horizon
+insert can never alias (via the per-level modulus) onto a slot one period below.
+Leave it 0 unless you schedule within one period of the full span (for example
+~24h out on a ~24h wheel); the cost is that you can then schedule up to
+`span - horizon_margin` instead of the full `span`.
 
 ## Notes & caveats
 

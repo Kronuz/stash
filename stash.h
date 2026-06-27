@@ -28,6 +28,8 @@
 #include <limits>                // for std::numeric_limits
 #include <memory>                // for std::unique_ptr / std::make_unique
 
+#include "reclaim.h"             // B: safe-memory-reclamation (announce registry)
+
 // Tracing and coloring are optional and fully injectable. Define
 // STASH_TRACE_HEADER (a header path) before including this file to plug in your
 // own logging macros (L_STASH / L_DEBUG_HOOK / L_EXC) and per-operation colors
@@ -70,12 +72,17 @@ struct StashContext {
 	std::atomic_ullong atom_first_valid_key;
 	std::atomic_ullong atom_last_valid_key;
 
+	// B: optional reclamation domain, shared by all producers and the one
+	// consumer of this wheel. Null (the default) = pre-B behavior, no announce.
+	stash_reclaim::Domain<>* reclaim = nullptr;
+
 	StashContext(StashContext&& o) noexcept
 		: op(std::move(o.op)),
 		  begin_key(std::move(o.begin_key)),
 		  end_key(std::move(o.end_key)),
 		  atom_first_valid_key(o.atom_first_valid_key.load()),
-		  atom_last_valid_key(o.atom_last_valid_key.load()) { }
+		  atom_last_valid_key(o.atom_last_valid_key.load()),
+		  reclaim(o.reclaim) { }
 
 	explicit StashContext(unsigned long long begin_key)
 		: op(Operation::walk),
@@ -391,6 +398,11 @@ public:
 		if (key >= get_end_base_key(ctx.atom_first_valid_key.load())) {
 			throw std::out_of_range("stash overlow");
 		}
+
+		// B: publish this key as in-flight for the whole insert (descent + bounds
+		// update), so the consumer can prove no producer is in a slot before it
+		// frees it. No-op when ctx.reclaim is null (pre-B). Released on scope exit.
+		stash_reclaim::InFlight<stash_reclaim::Domain<>> _inflight(ctx.reclaim, key);
 
 		put(ctx, key, std::forward<Args>(args)...);
 

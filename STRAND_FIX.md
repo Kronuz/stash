@@ -198,3 +198,69 @@ leaf walk.
 - `peep` passing a pending leaf must not perturb the cursors — verify.
 - Whether, with care, the descent window can also be linearized so the R1 margin
   could finally drop — a follow-on, not part of this addition.
+
+## Results (implemented: Step 1 = commit `8922441`, Steps 2+3 = `744b82f`)
+
+Measured on a 14-physical-core host with `test/concurrent.cc`. Loss = added −
+fired (count and XOR both checked). Each producer is one thread; the consumer and
+a watchdog add two more, so `producers + 2` is the thread count against 14 cores.
+
+### Step 1 alone regresses under oversubscription
+
+`atom_ready` closes the strand perfectly while threads ≤ cores, but once
+oversubscribed it loses *more* than `main`, because a producer preempted between
+RESERVE and FILL pins the contiguous frontier and hides every slot filled behind
+its hole (head-of-line block); with no `pending_floor` cap the wheel advances
+past that leaf and `clean` drops the whole hidden tail.
+
+| producers | threads | main | Step 1 only |
+|-----------|---------|------|-------------|
+| 10–11     | 12–13   | 53–62 | **0** |
+| 12        | 14      | 47    | 56 |
+| 13        | 15      | 232   | **3130** |
+| 14        | 16      | 2295  | 1466 |
+
+### Steps 2+3: structurally lossless
+
+With `clean`'s reclamation isolated (margin larger than the run, so any loss is a
+structural race rather than a reclamation drop), Steps 2+3 lose nothing at any
+producer count, oversubscribed or not — 4/4 repeats at 13/14/16 producers all
+read 0. `main` keeps losing the strand everywhere.
+
+| producers | main | Steps 1+2+3 |
+|-----------|------|-------------|
+| 10        | 85   | **0** |
+| 12        | 74   | **0** |
+| 13        | 59   | **0** |
+| 14        | 44   | **0** |
+| 16        | 50   | **0** |
+
+The leaf strand is closed (Step 1 at threads ≤ cores) and the head-of-line tail
+is recovered rather than dropped (Steps 2+3 under oversubscription). `test.cc`,
+`longevity.cc`, and the leak→plateau demo stay green.
+
+### What is *not* closed: the reclamation race with active clean
+
+Under oversubscription **with `clean` running at a finite margin**, both `main`
+and the fixed build still lose ~1500–3700 per 3 s run, roughly equally, and the
+loss does not shrink as the margin grows (64 ms → 1024 ms is flat and noisy).
+That is not the strand — `main` has no `atom_ready` yet loses the same. It is a
+reclamation race: `clean` frees a subtree while a *preempted* thread still holds
+a reference into it. A wall-clock margin cannot close this with certainty under
+arbitrary preemption (the whole reason certain reclamation needs SMR, not a
+timer). It is the R1/R2 boundary, documented as out of scope for this addition.
+
+### Sanitizer status (host toolchain limitation)
+
+ASan and TSan could not be run on this host: Apple clang 17 on macOS 26.5.1.
+ASan hangs during runtime init (`__asan::InitializeShadowMemory` spins iterating
+the dyld shared cache); TSan segfaults at thread creation — a 5-line
+`std::thread` program reproduces both, so it is the toolchain, not this code.
+The ASan/TSan rows of the proof gate must run on Linux/CI or a newer LLVM.
+
+As a substitute, `libgmalloc` (guard-page allocator, unmaps on free so any
+use-after-free faults immediately) ran the oversubscribed, clean-on config across
+~174k inserts with **no guard-page fault**. Combined with the no-UAF accounting
+above, this indicates the residual loss is dropped/detached subtrees (accounting)
+rather than writes into freed live memory — though it is weaker evidence than a
+clean TSan/ASan pass and does not replace one.

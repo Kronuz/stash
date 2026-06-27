@@ -113,7 +113,10 @@ struct StashContext {
 			return false;
 		}
 
-		if (key > atom_last_valid_key.load()) {
+		// acquire: the producer widens atom_last_valid_key (release) only after the
+		// path to `key` is built, so acquiring it here orders our descent after that
+		// path's publication -- we never chase a key whose nodes we can't yet see.
+		if (key > atom_last_valid_key.load(std::memory_order_acquire)) {
 			return false;
 		}
 
@@ -166,23 +169,25 @@ protected:
 			: atom_chunk(nullptr),
 			  atom_next(nullptr) { }
 
+		// Move and destroy happen single-threaded (construction / teardown of an
+		// unshared node), so these atomics need no inter-thread ordering: relaxed.
 		Data(Data&& o) noexcept
-			: atom_chunk(o.atom_chunk.load()),
-			  atom_next(o.atom_next.load()) { }
+			: atom_chunk(o.atom_chunk.load(std::memory_order_relaxed)),
+			  atom_next(o.atom_next.load(std::memory_order_relaxed)) { }
 
 		~Data() noexcept {
 			try {
-				auto next = atom_next.exchange(nullptr);
+				auto next = atom_next.exchange(nullptr, std::memory_order_relaxed);
 				while (next) {
-					auto next_next = next->atom_next.exchange(nullptr);
+					auto next_next = next->atom_next.exchange(nullptr, std::memory_order_relaxed);
 					delete next;
 					next = next_next;
 				}
 
-				auto chunk = atom_chunk.exchange(nullptr);
+				auto chunk = atom_chunk.exchange(nullptr, std::memory_order_relaxed);
 				if (chunk) {
 					for (auto& atom_ptr : *chunk) {
-						auto ptr = atom_ptr.exchange(nullptr);
+						auto ptr = atom_ptr.exchange(nullptr, std::memory_order_relaxed);
 						if (ptr) {
 							delete ptr;
 						}
@@ -196,7 +201,9 @@ protected:
 
 		StashState get(std::atomic<_Tp*>** pptr_atom_ptr, size_t slot, bool spawn,
 		               Cursor* cursor = nullptr) {
-			if (!spawn && !atom_next && !atom_chunk) {
+			if (!spawn &&
+			    !atom_next.load(std::memory_order_acquire) &&
+			    !atom_chunk.load(std::memory_order_acquire)) {
 				return StashState::StashEmpty;
 			}
 
@@ -219,14 +226,19 @@ protected:
 			}
 
 			for (; c < chunk_num; ++c) {
-				auto next = _data->atom_next.load();
+				// acquire: a non-null next must carry the producer's release of the
+				// node it published (below), so we see that node fully constructed.
+				auto next = _data->atom_next.load(std::memory_order_acquire);
 				if (!next) {
 					if (!spawn) {
 						if (cursor) { cursor->node = _data; cursor->base = c * _Size; }
 						return StashState::StashShort;
 					}
 					auto tmp = std::make_unique<Data>();
-					if (_data->atom_next.compare_exchange_strong(next, tmp.get())) {
+					// release on success publishes the new node; acquire on failure
+					// loads the winner so we then read its contents safely.
+					if (_data->atom_next.compare_exchange_strong(next, tmp.get(),
+					        std::memory_order_release, std::memory_order_acquire)) {
 						next = tmp.release();
 					}  // else: unique_ptr frees the loser (exception-safe)
 				}
@@ -235,13 +247,16 @@ protected:
 
 			if (cursor) { cursor->node = _data; cursor->base = chunk_num * _Size; }
 
-			auto chunk = _data->atom_chunk.load();
+			auto chunk = _data->atom_chunk.load(std::memory_order_acquire);
 			if (!chunk) {
 				if (!spawn) {
 					return StashState::ChunkEmpty;
 				}
 				auto tmp = std::make_unique<Chunks>();
-				if (_data->atom_chunk.compare_exchange_strong(chunk, tmp.get())) {
+				// release publishes the new chunk array; acquire on failure loads the
+				// winner so the slots we hand out are the published ones.
+				if (_data->atom_chunk.compare_exchange_strong(chunk, tmp.get(),
+				        std::memory_order_release, std::memory_order_acquire)) {
 					chunk = tmp.release();
 				}  // else: unique_ptr frees the loser (exception-safe)
 			}
@@ -357,7 +372,7 @@ public:
 
 			if (ptr_atom_ptr) {
 				auto& atom_ptr = *ptr_atom_ptr;
-				auto ptr = atom_ptr.load();
+				auto ptr = atom_ptr.load(std::memory_order_acquire);   // see the published child
 				if (ptr) {
 					if (ctx.op == StashContext::Operation::clean) {
 						// Reclaim: once a slot's whole window is behind the safe
@@ -367,7 +382,9 @@ public:
 						// new_first_valid_key is this slot's upper bound; only drop
 						// slots entirely behind the cutoff, never the straddling one.
 						if (new_first_valid_key <= ctx.end_key) {
-							ptr = atom_ptr.exchange(nullptr);
+							// acquire: own the subtree fully before deleting it (the
+							// store of null publishes nothing, so no release needed).
+							ptr = atom_ptr.exchange(nullptr, std::memory_order_acquire);
 							if (ptr) {
 								L_STASH("StashSlots::" + LIGHT_RED + "CLEAR" + CLEAR_COLOR + " - {}_Mod:{}, begin_key:{}, end_key:{}, cur:{}, limit_key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}, op:{}", ctx._col(), _Mod, ctx.begin_key, ctx.end_key, cur, limit_key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load(), ctx._op());
 								delete ptr;
@@ -420,8 +437,12 @@ public:
 					new_first_valid_key = pending_base;
 				}
 			}
-			auto first_valid_key = ctx.atom_first_valid_key.load();
-			while (new_first_valid_key > first_valid_key && !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, new_first_valid_key));
+			// release on success publishes the advanced low-water mark; the loop's
+			// reload only needs the latest value, so relaxed there.
+			auto first_valid_key = ctx.atom_first_valid_key.load(std::memory_order_relaxed);
+			while (new_first_valid_key > first_valid_key &&
+			       !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, new_first_valid_key,
+			           std::memory_order_release, std::memory_order_relaxed));
 		}
 
 		return found;
@@ -441,10 +462,13 @@ public:
 		Stash_T::get(&ptr_atom_ptr, slot, true);
 
 		auto& atom_ptr = *ptr_atom_ptr;
-		auto ptr = atom_ptr.load();
+		auto ptr = atom_ptr.load(std::memory_order_acquire);
 		if (!ptr) {
 			auto tmp = std::make_unique<_Tp>();
-			if (atom_ptr.compare_exchange_strong(ptr, tmp.get())) {
+			// release publishes the new child subtree; acquire on failure loads the
+			// winner so the recursive put() below descends into a visible node.
+			if (atom_ptr.compare_exchange_strong(ptr, tmp.get(),
+			        std::memory_order_release, std::memory_order_acquire)) {
 				ptr = tmp.release();
 			}  // else: unique_ptr frees the loser (exception-safe)
 		}
@@ -457,7 +481,7 @@ public:
 		// R2: the schedulable horizon, minus an optional keep-out zone. Rejecting
 		// keys within horizon_margin of the end stops a near-horizon insert from
 		// aliasing onto a slot being reclaimed one wheel period below.
-		auto horizon = get_end_base_key(ctx.atom_first_valid_key.load());
+		auto horizon = get_end_base_key(ctx.atom_first_valid_key.load(std::memory_order_acquire));
 		if (horizon > ctx.horizon_margin) {
 			horizon -= ctx.horizon_margin;
 		}
@@ -549,7 +573,7 @@ public:
 
 			if (ptr_atom_ptr) {
 				auto& atom_ptr = *ptr_atom_ptr;
-				auto ptr = atom_ptr.load();
+				auto ptr = atom_ptr.load(std::memory_order_acquire);   // see the filled value
 				if (ptr) {
 					bool returning = false;
 					if (ctx.op != StashContext::Operation::clean) {
@@ -562,7 +586,8 @@ public:
 						}
 					}
 					if (ctx.op != StashContext::Operation::peep) {
-						ptr = atom_ptr.exchange(nullptr);
+						// acquire: own the value before firing/deleting it.
+						ptr = atom_ptr.exchange(nullptr, std::memory_order_acquire);
 						if (ptr) {
 							L_STASH("StashValues::" + LIGHT_RED + "CLEAR" + CLEAR_COLOR + " - {}cur:{}, cur:{}, atom_end:{}, op:{}", ctx._col(), cur, (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur, atom_end.load(), ctx._op());
 							delete ptr;
@@ -596,8 +621,10 @@ public:
 	void put(StashContext& ctx, unsigned long long key, Args&&... args) {
 		// RESERVE: claim a slot and ensure its physical location exists. The path
 		// to this leaf was already built during descent, so the consumer can reach
-		// it the instant the bound below is published.
-		auto slot = atom_end++;
+		// it the instant the bound below is published. relaxed: the slot index is
+		// private, and this increment is made visible to the consumer's pending
+		// check by the bound's release-store below (sequenced after it).
+		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}slot:{}, atom_end:{}, op:{}", ctx._col(), slot, atom_end.load(), ctx._op());
 
 		std::atomic<_Tp*>* ptr_atom_ptr;
@@ -610,17 +637,28 @@ public:
 		// Publishing after the fill (where these two CAS loops used to live, at the
 		// end of StashSlots::add) would hide the pending state and let the
 		// consumer's low-water mark run past an in-flight insert.
-		auto first_valid_key = ctx.atom_first_valid_key.load();
-		while (key < first_valid_key && !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, key));
-		auto last_valid_key = ctx.atom_last_valid_key.load();
-		while (key > last_valid_key && !ctx.atom_last_valid_key.compare_exchange_weak(last_valid_key, key));
+		// release on success: the bound is the leaf's publication point. Acquiring
+		// it (check(), ret_next, the R2 horizon) orders the reader after the path
+		// built during descent and after this slot's reserve.
+		auto first_valid_key = ctx.atom_first_valid_key.load(std::memory_order_relaxed);
+		while (key < first_valid_key &&
+		       !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, key,
+		           std::memory_order_release, std::memory_order_relaxed));
+		auto last_valid_key = ctx.atom_last_valid_key.load(std::memory_order_relaxed);
+		while (key > last_valid_key &&
+		       !ctx.atom_last_valid_key.compare_exchange_weak(last_valid_key, key,
+		           std::memory_order_release, std::memory_order_relaxed));
 
-		// FILL: publish the value into the reserved slot.
+		// FILL: publish the value into the reserved slot. Only this producer writes
+		// this slot (the reserve made it private), so the null-check load is relaxed;
+		// the CAS releases so a consumer that later reads it past atom_ready -- or
+		// another producer's COMMIT -- sees the value fully constructed.
 		auto& atom_ptr = *ptr_atom_ptr;
-		auto ptr = atom_ptr.load();
+		auto ptr = atom_ptr.load(std::memory_order_relaxed);
 		if (!ptr) {
 			auto tmp = std::make_unique<_Tp>(std::forward<Args>(args)...);
-			if (atom_ptr.compare_exchange_strong(ptr, tmp.get())) {
+			if (atom_ptr.compare_exchange_strong(ptr, tmp.get(),
+			        std::memory_order_release, std::memory_order_relaxed)) {
 				ptr = tmp.release();
 			}  // else: unique_ptr frees the loser (exception-safe)
 		}

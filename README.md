@@ -48,6 +48,39 @@ pointer-like, a "zero" value reads as absent, and the walk side is
 single-consumer. If you want concurrent consumers, a generic associative
 container, or arbitrary value types, this is the wrong tool.
 
+## Cost
+
+For `N` live values and `P` concurrent producers, with keys spread across the
+future (the workload it is built for):
+
+- **Insert** is `O(1)` amortized and lock-free: a `Div`/`Mod` descent through a
+  constant number of levels, then an append to the leaf. The only shared writes
+  are the valid-key bounds and the leaf's append cursor, both non-blocking, so no
+  producer ever waits on another. Convergent keys (everything on one instant)
+  degrade the leaf append toward `O(b)` for `b` values in that one bucket.
+- **Drain** (`walk`) is `O(1)` amortized per fired value: the walk follows the
+  valid-key bounds and skips the empty stretches, and a per-leaf cursor keeps
+  sequential reads from re-walking the chunk chain.
+- **Memory** is `O(N)` plus the sparse path nodes actually touched. It is **not**
+  `O(range / resolution)` like a flat wheel: a 24-hour, 1 ms wheel would be 86 M
+  buckets preallocated; `stash` builds only the slots that hold something.
+
+How it compares, fairly:
+
+| | insert under `P` producers | memory | answers "due now?" |
+| --- | --- | --- | --- |
+| **stash** | `O(1)` amortized, lock-free | `O(N)`, sparse | yes (slot-quantized) |
+| heap + mutex | `O(P log N)`, serialized on one lock | `O(N)` | yes (exact order) |
+| flat timer wheel | `O(1)` | `O(range/res)` preallocated | yes (slot-quantized) |
+| lock-free queue | `O(1)`, scales ~linearly | `O(N)` | **no** |
+
+The asymptotics are not the headline; the columns are. Against a heap the win is
+that producers never serialize behind a lock, so tail latency stays flat under
+contention. Against a flat wheel it is `O(N)` memory instead of a preallocated
+continent. Against a lock-free queue, `stash` can answer "what is due now" and the
+queue cannot. It owns one cell of that table: many producers, one consumer, drain
+in time order, memory proportional to what is live.
+
 ## Install
 
 Header-only. Drop `stash.h` and `stash_trace.h` on your include path and:

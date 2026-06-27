@@ -262,6 +262,27 @@ margin-based `clean`.
 `clean`, bounded with it); `test/concurrent.cc` exercises the envelope under
 producer/consumer contention with ASan/TSan.
 
+### Hardening knobs
+
+Two of the three envelope dangers have cheap, exact fixes; the third (the
+bounds-ordering strand) does not, short of the planned redesign.
+
+- **R1 — boundary use-after-free.** Only possible if a producer stalls *longer
+  than the clean margin* mid-`add`. The clean cutoff (`now - margin`, the
+  consumer's choice) is the safety buffer: a bigger margin tolerates longer
+  stalls at the cost of holding more not-yet-reclaimed structure. The scheduler's
+  one-minute margin already makes this astronomically unlikely; raise it if you
+  must tolerate longer pauses. Not a code change here — it is the consumer's
+  `clean` cutoff.
+- **R2 — near-horizon aliasing.** Set `StashContext::horizon_margin` (default 0)
+  to a keep-out zone `>=` the clean margin: `add()` then rejects keys within that
+  much of the horizon, so a near-horizon insert can never alias onto a slot being
+  reclaimed one period below. The operational cost is that you can schedule up to
+  `span - horizon_margin` instead of the full `span` (e.g. ~24h minus a minute).
+- **The strand** has no cheap knob: it is the walk observing an insert mid-flight
+  (a leaf slot reserved with `atom_end++` but not yet written, or a bound bumped
+  after the value). Closing it needs a linearized insert/walk (the redesign).
+
 ## Notes & caveats
 
 - **Value type must be pointer-like** (bool-testable and dereferenceable, e.g.

@@ -63,3 +63,32 @@ design calls for. → Step 3.
 is tractable, but the count is a thing to watch: if the fixes keep multiplying
 without converging, that is the signal to stop (see the project's "drop it if it
 isn't a jewel" bar).
+
+## Step 3 — leaf linearization: a structural wall (reverted)
+
+**Attempt.** Make the walk stop at an unfilled leaf hole instead of skipping it.
+
+**Result.** Worse, not better: 4 producers / margin 16 jumped to ~11.7k lost, and
+single-producer (always 0) broke. Reverted.
+
+**Why it can't be a small fix.** Returning "false" from the leaf on a hole tells
+the *parent* (the wheel walk) "this leaf is empty", so the wheel advances past the
+whole leaf -- stranding everything in it. Not returning means the walk must *wait*
+at the hole. And because producers reserve with `atom_end++` and fill **out of
+order**, there is no single "committed up to N" counter that is safe; the only
+correct construction is a **per-slot ready flag** (a Vyukov-style sequenced MPMC
+buffer): each slot publishes when it is written, and the walk scans contiguously,
+waiting at the first not-ready slot. That replaces the elegant append-only leaf
+with a much heavier structure.
+
+**Where this leaves B.** Full certainty needs three things, not one:
+1. The SMR free (announce + hazard-scan + retire) -- designed, not built.
+2. The wheel-level walk clamp -- built (Step 2), cheap, partial.
+3. A sequenced-MPMC leaf -- a real redesign of the core leaf.
+
+Items 1 and 3 are each substantial, and together they bury the thing that made
+`stash` a jewel (a simple sparse lock-free wheel) under reclamation and
+linearization machinery. This is the "complex trash" line the project set out not
+to cross. Recommendation recorded for the keep/drop decision: **lean drop** --
+keep A (shipped, correct in its documented envelope), preserve this branch as the
+honest record of what full certainty would cost and why we stopped.

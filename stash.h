@@ -70,12 +70,20 @@ struct StashContext {
 	std::atomic_ullong atom_first_valid_key;
 	std::atomic_ullong atom_last_valid_key;
 
+	// R2: keep-out zone at the far end of the wheel. add() rejects keys within
+	// horizon_margin of the horizon, so a near-horizon insert can never alias onto
+	// a physical slot the consumer is reclaiming one period below. 0 = off (the
+	// full span is schedulable, pre-R2 behavior). Set it >= the consumer's clean
+	// margin to close the aliasing window.
+	unsigned long long horizon_margin = 0;
+
 	StashContext(StashContext&& o) noexcept
 		: op(std::move(o.op)),
 		  begin_key(std::move(o.begin_key)),
 		  end_key(std::move(o.end_key)),
 		  atom_first_valid_key(o.atom_first_valid_key.load()),
-		  atom_last_valid_key(o.atom_last_valid_key.load()) { }
+		  atom_last_valid_key(o.atom_last_valid_key.load()),
+		  horizon_margin(o.horizon_margin) { }
 
 	explicit StashContext(unsigned long long begin_key)
 		: op(Operation::walk),
@@ -388,7 +396,14 @@ public:
 
 	template<typename... Args>
 	void add(StashContext& ctx, unsigned long long key, Args&&... args) {
-		if (key >= get_end_base_key(ctx.atom_first_valid_key.load())) {
+		// R2: the schedulable horizon, minus an optional keep-out zone. Rejecting
+		// keys within horizon_margin of the end stops a near-horizon insert from
+		// aliasing onto a slot being reclaimed one wheel period below.
+		auto horizon = get_end_base_key(ctx.atom_first_valid_key.load());
+		if (horizon > ctx.horizon_margin) {
+			horizon -= ctx.horizon_margin;
+		}
+		if (key >= horizon) {
 			throw std::out_of_range("stash overlow");
 		}
 

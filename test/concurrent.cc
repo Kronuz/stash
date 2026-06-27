@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
 	double seconds = argc > 2 ? atof(argv[2]) : 2.0;
 	unsigned long long margin = (argc > 3 ? (unsigned long long)atoll(argv[3]) : 32) * MS;
 	unsigned long long pause_ns = argc > 4 ? (unsigned long long)atoll(argv[4]) : 0;  // throttle per add
+	int use_reclaim = argc > 5 ? atoi(argv[5]) : 1;  // B: 1 = announce/clamp/hazard on
 
 	// Unbuffered output (so nothing is lost on a crash) + a watchdog that turns an
 	// infinite loop (structural corruption) into a reported FAIL instead of a hang.
@@ -93,6 +94,8 @@ int main(int argc, char** argv) {
 	auto wheel = std::make_unique<Wheel>();
 	StashContext ctx(now_ns());     // shared by producers (add) and consumer (walk)
 	StashContext cctx(now_ns());    // consumer-only (clean)
+	stash_reclaim::Domain<> domain; // B: shared announce registry
+	if (use_reclaim) { ctx.reclaim = &domain; cctx.reclaim = &domain; }
 
 	std::atomic<uint64_t> uid_gen{0};
 	std::atomic<uint64_t> added_count{0}, added_xor{0};

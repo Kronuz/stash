@@ -361,6 +361,17 @@ public:
 				}
 			}
 			auto new_first_valid_key = get_dec_base_key(ctx.begin_key);
+			// B (walk clamp): never advance the walk's low-water mark past a key a
+			// producer is still inserting. A producer announces its key for the whole
+			// insert, so safe_floor() sits at or below any in-flight key; clamping here
+			// means the walker cannot step over a late insert and strand it. IDLE
+			// (no producer in flight) is UINT64_MAX, so this never clamps then.
+			if (ctx.op == StashContext::Operation::walk && ctx.reclaim) {
+				auto floor = ctx.reclaim->safe_floor();
+				if (new_first_valid_key > floor) {
+					new_first_valid_key = floor;
+				}
+			}
 			auto first_valid_key = ctx.atom_first_valid_key.load();
 			while (new_first_valid_key > first_valid_key && !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, new_first_valid_key));
 		}

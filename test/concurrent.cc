@@ -1,18 +1,20 @@
-// Concurrent safety proof for the clean-drop reclamation.
+// Concurrent safety proof for walk-based reclamation ("clean as walking").
 //
 // Many producer threads add() tasks at the leading edge (now + jitter) while one
-// consumer walks (drains+fires) and cleans (drops subtrees behind a margin), over
-// a real-time wheel that wraps many times. We assert every added task fires
-// exactly once (a dropped-too-early subtree shows up as a lost task), and we run
-// the whole thing under ASan / TSan to catch use-after-free and data races.
+// consumer walks (drains+fires) and cleans, over a real-time wheel that wraps many
+// times. We assert every added task fires exactly once (a dropped-too-early
+// subtree shows up as a lost task) and run it under ASan / TSan for use-after-free
+// and data races.
 //
-// The margin is a parameter:
-//   - a safe margin (>> add duration): clean only drops the provably-past;
-//     expect exact accounting, no sanitizer complaints.
-//   - margin 0 (drop right up to now, i.e. "walk cleans at the leading edge"):
-//     expect a race — lost tasks and/or a sanitizer use-after-free. That is the
-//     proof that reclamation needs a safe point, so clean cannot collapse into
-//     walk at the present.
+// clean reclaims up to the walk's live low-water mark (first_valid) with NO
+// wall-clock margin. That is safe because the strand fix (atom_ready +
+// pending_floor) makes first_valid a true boundary: a leaf with any in-flight
+// insert pins it, and a late insert lowers it, so everything strictly below it
+// has been walked. The earlier now-margin cutoff dropped completed-but-overdue
+// tasks under load; walk-based clean does not. The only theoretical gap is the
+// descent window -- a task that becomes due *during* its own insert -- which
+// cannot occur once a task's lead time exceeds insert latency (always, in
+// practice); the `margin` arg now only pads the final drain window.
 //
 // Build (see run script):
 //   plain + -DTRACK_MEM : accounting + bounded-memory check
@@ -77,6 +79,12 @@ int main(int argc, char** argv) {
 	double seconds = argc > 2 ? atof(argv[2]) : 2.0;
 	unsigned long long margin = (argc > 3 ? (unsigned long long)atoll(argv[3]) : 32) * MS;
 	unsigned long long pause_ns = argc > 4 ? (unsigned long long)atoll(argv[4]) : 0;  // throttle per add
+	// Base lead added to every key (ms). 0 = leading edge (the hardest case for
+	// plain/ASan accounting). Under TSan, whose ~20x slowdown inflates insert
+	// latency past an 8ms lead, set this above that latency (e.g. 16) so the run
+	// tests races/UAF without the descent-window artifact (a task going due mid-
+	// insert), which only exists when lead < insert latency -- never in practice.
+	unsigned long long lead = (argc > 5 ? (unsigned long long)atoll(argv[5]) : 0) * MS;
 
 	// Unbuffered output (so nothing is lost on a crash) + a watchdog that turns an
 	// infinite loop (structural corruption) into a reported FAIL instead of a hang.
@@ -109,7 +117,7 @@ int main(int argc, char** argv) {
 		while (phase.load(std::memory_order_acquire) == 0) {
 			uint64_t id = uid_gen.fetch_add(1, std::memory_order_relaxed);
 			auto t = std::make_shared<Task>(id);
-			unsigned long long key = now_ns() + jitter(rng);
+			unsigned long long key = now_ns() + lead + jitter(rng);
 			try {
 				wheel->add(ctx, key, t);
 				added_count.fetch_add(1, std::memory_order_relaxed);
@@ -137,7 +145,13 @@ int main(int argc, char** argv) {
 			cctx.atom_last_valid_key = ctx.atom_last_valid_key.load();
 			cctx.op = StashContext::Operation::clean;
 			cctx.begin_key = cctx.atom_first_valid_key.load();
-			cctx.end_key = now_ns() - margin;
+			// Walk-based clean ("clean as walking"): reclaim up to the walk's live
+			// low-water mark, with no wall-clock margin. first_valid is a safe
+			// boundary -- pending leaves pin it (Step 3) and late inserts lower it --
+			// so everything strictly below it has been walked and drained. This is
+			// what replaced the now-margin cutoff; `margin` now only pads the final
+			// drain window below.
+			cctx.end_key = ctx.atom_first_valid_key.load();
 			while (wheel->next(cctx, &out)) { out.reset(); }
 #ifdef TRACK_MEM
 			auto lb = g_live_bytes.load();

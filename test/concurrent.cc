@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
 		TaskPtr out;
 		while (phase.load(std::memory_order_acquire) == 0) {
 			ctx.op = StashContext::Operation::walk;
+			ctx.pending_floor = StashContext::IDLE;   // Step 3: fresh per walk
 			ctx.begin_key = ctx.atom_first_valid_key.load();
 			ctx.end_key = now_ns();
 			while (wheel->next(ctx, &out)) { if (out) fire(out); out.reset(); }
@@ -151,6 +152,7 @@ int main(int argc, char** argv) {
 		auto drain_until = now_ns() + 3ULL * SPAN + margin;
 		while (now_ns() < drain_until) {
 			ctx.op = StashContext::Operation::walk;
+			ctx.pending_floor = StashContext::IDLE;   // Step 3: fresh per walk
 			ctx.begin_key = ctx.atom_first_valid_key.load();
 			ctx.end_key = now_ns();
 			while (wheel->next(ctx, &out)) { if (out) fire(out); out.reset(); }

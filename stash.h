@@ -62,6 +62,9 @@ struct StashContext {
 		clean,
 	};
 
+	// Sentinel for pending_floor: "no in-flight insert seen this walk".
+	static constexpr unsigned long long IDLE = std::numeric_limits<unsigned long long>::max();
+
 	Operation op;
 
 	unsigned long long begin_key;
@@ -77,13 +80,22 @@ struct StashContext {
 	// margin to close the aliasing window.
 	unsigned long long horizon_margin = 0;
 
+	// Step 3: lowest key of a leaf seen *pending* (reserved-not-written) during a
+	// walk. The wheel caps its first_valid advance at this key, so reclamation
+	// never crosses a leaf with an in-flight insert -- the held-back tail behind a
+	// stalled producer is re-drained next pass instead of being dropped. Reset to
+	// IDLE by the consumer at the start of each walk; only ever lowered, by the
+	// leaf, during that walk.
+	unsigned long long pending_floor = IDLE;
+
 	StashContext(StashContext&& o) noexcept
 		: op(std::move(o.op)),
 		  begin_key(std::move(o.begin_key)),
 		  end_key(std::move(o.end_key)),
 		  atom_first_valid_key(o.atom_first_valid_key.load()),
 		  atom_last_valid_key(o.atom_last_valid_key.load()),
-		  horizon_margin(o.horizon_margin) { }
+		  horizon_margin(o.horizon_margin),
+		  pending_floor(o.pending_floor) { }
 
 	explicit StashContext(unsigned long long begin_key)
 		: op(Operation::walk),
@@ -362,6 +374,18 @@ public:
 				}
 			}
 			auto new_first_valid_key = get_dec_base_key(ctx.begin_key);
+			// Step 3: never advance the low-water mark past a leaf seen pending this
+			// walk. Capping first_valid at the pending leaf's base keeps the next
+			// walk descending to it (to drain the held-back tail behind a stalled
+			// producer) and keeps clean -- seeded from first_valid -- from reclaiming
+			// it. pending_floor is IDLE when nothing is pending (and stays IDLE for
+			// the clean context), so this is a no-op in the common case.
+			if (ctx.pending_floor != StashContext::IDLE) {
+				auto pending_base = get_base_key(ctx.pending_floor);
+				if (pending_base < new_first_valid_key) {
+					new_first_valid_key = pending_base;
+				}
+			}
 			auto first_valid_key = ctx.atom_first_valid_key.load();
 			while (new_first_valid_key > first_valid_key && !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, new_first_valid_key));
 		}
@@ -407,13 +431,11 @@ public:
 			throw std::out_of_range("stash overlow");
 		}
 
+		// Step 2: the valid-key bound is now published inside the leaf's put(),
+		// between RESERVE and FILL, so it covers `key` while the slot is still a
+		// hole. It used to be widened here, after the whole descent+fill returned.
+		L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load());
 		put(ctx, key, std::forward<Args>(args)...);
-
-		auto first_valid_key = ctx.atom_first_valid_key.load();
-		auto last_valid_key = ctx.atom_last_valid_key.load();
-		L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, first_valid_key, last_valid_key);
-		while (key < first_valid_key && !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, key));
-		while (key > last_valid_key && !ctx.atom_last_valid_key.compare_exchange_weak(last_valid_key, key));
 	}
 };
 
@@ -510,17 +532,47 @@ public:
 			}
 		}
 
+		// Step 3: this leaf is exhausted up to atom_ready. If atom_ready < atom_end
+		// it is *pending* -- a producer reserved a slot here but has not filled it
+		// (and the contiguous frontier hides any slots filled behind that hole).
+		// Record this leaf's key as a floor; the wheel refuses to advance
+		// first_valid past it, so the held-back tail is re-drained next pass rather
+		// than reclaimed out from under the stalled producer. Walk only: peep is
+		// read-only, and clean runs strictly behind walk_cur where there are no holes.
+		if (ctx.op == StashContext::Operation::walk &&
+		    atom_ready.load(std::memory_order_acquire) < atom_end.load(std::memory_order_acquire)) {
+			if (ctx.begin_key < ctx.pending_floor) {
+				ctx.pending_floor = ctx.begin_key;
+			}
+		}
+
 		return false;
 	}
 
 	template<typename... Args>
-	void put([[maybe_unused]] StashContext& ctx, unsigned long long, Args&&... args) {
+	void put(StashContext& ctx, unsigned long long key, Args&&... args) {
+		// RESERVE: claim a slot and ensure its physical location exists. The path
+		// to this leaf was already built during descent, so the consumer can reach
+		// it the instant the bound below is published.
 		auto slot = atom_end++;
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}slot:{}, atom_end:{}, op:{}", ctx._col(), slot, atom_end.load(), ctx._op());
 
 		std::atomic<_Tp*>* ptr_atom_ptr;
 		Stash_T::get(&ptr_atom_ptr, slot, true);
 
+		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
+		// `key`. Doing this *before* the fill is the crux of Step 2 -- it lets the
+		// walk descend to this leaf while the slot is still a hole and observe it
+		// as pending (atom_ready < atom_end), so Step 3 can pin first_valid to it.
+		// Publishing after the fill (where these two CAS loops used to live, at the
+		// end of StashSlots::add) would hide the pending state and let the
+		// consumer's low-water mark run past an in-flight insert.
+		auto first_valid_key = ctx.atom_first_valid_key.load();
+		while (key < first_valid_key && !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, key));
+		auto last_valid_key = ctx.atom_last_valid_key.load();
+		while (key > last_valid_key && !ctx.atom_last_valid_key.compare_exchange_weak(last_valid_key, key));
+
+		// FILL: publish the value into the reserved slot.
 		auto& atom_ptr = *ptr_atom_ptr;
 		auto ptr = atom_ptr.load();
 		if (!ptr) {

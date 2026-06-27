@@ -593,9 +593,19 @@ public:
 		auto end = atom_end.load(std::memory_order_acquire);
 		auto r = atom_ready.load(std::memory_order_acquire);
 		while (r < end) {
-			std::atomic<_Tp*>* rp = nullptr;
-			if (Stash_T::get(&rp, r, false) != StashState::Ok ||
-			    !rp || !rp->load(std::memory_order_acquire)) {
+			std::atomic<_Tp*>* rp;
+			if (r == slot) {
+				// The slot we just filled. Reuse the pointer we already hold instead
+				// of re-walking the chunk chain (get() is O(slot/_Size)). This is no
+				// less safe than the fill above, which dereferences the same pointer:
+				// both run in put() after the bound is published, and if the descent
+				// window frees this leaf the loads of atom_end/atom_ready above fault
+				// first -- identically with or without this fast path.
+				rp = ptr_atom_ptr;
+			} else if (Stash_T::get(&rp, r, false) != StashState::Ok || !rp) {
+				break;
+			}
+			if (!rp->load(std::memory_order_acquire)) {
 				break;   // slot r not written yet (a hole); its producer will advance it
 			}
 			if (atom_ready.compare_exchange_weak(r, r + 1,

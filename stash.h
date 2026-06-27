@@ -26,6 +26,7 @@
 #include <atomic>                // for std::atomic
 #include <cassert>               // for assert
 #include <limits>                // for std::numeric_limits
+#include <memory>                // for std::unique_ptr / std::make_unique
 
 // Tracing and coloring are optional and fully injectable. Define
 // STASH_TRACE_HEADER (a header path) before including this file to plug in your
@@ -178,12 +179,10 @@ protected:
 						if (!spawn) {
 							return StashState::StashShort;
 						}
-						auto tmp = new Data;
-						if (_data->atom_next.compare_exchange_strong(next, tmp)) {
-							next = tmp;
-						} else {
-							delete tmp;
-						}
+						auto tmp = std::make_unique<Data>();
+						if (_data->atom_next.compare_exchange_strong(next, tmp.get())) {
+							next = tmp.release();
+						}  // else: unique_ptr frees the loser (exception-safe)
 					}
 					_data = next;
 				}
@@ -194,12 +193,10 @@ protected:
 				if (!spawn) {
 					return StashState::ChunkEmpty;
 				}
-				auto tmp = new Chunks{{ }};
-				if (_data->atom_chunk.compare_exchange_strong(chunk, tmp)) {
-					chunk = tmp;
-				} else {
-					delete tmp;
-				}
+				auto tmp = std::make_unique<Chunks>();
+				if (_data->atom_chunk.compare_exchange_strong(chunk, tmp.get())) {
+					chunk = tmp.release();
+				}  // else: unique_ptr frees the loser (exception-safe)
 			}
 
 			auto& atom_ptr = (*chunk)[slot];
@@ -308,15 +305,23 @@ public:
 				auto& atom_ptr = *ptr_atom_ptr;
 				auto ptr = atom_ptr.load();
 				if (ptr) {
-					auto status = ptr->next(ctx, value_ptr, new_first_valid_key);
-					if (status) {
-						if (ctx.op == StashContext::Operation::clean) {
+					if (ctx.op == StashContext::Operation::clean) {
+						// Reclaim: once a slot's whole window is behind the safe
+						// cutoff (ctx.end_key), the single walker is provably past it
+						// and no producer can write the past, so the whole subtree can
+						// be dropped in one shot with no further checks or locks.
+						// new_first_valid_key is this slot's upper bound; only drop
+						// slots entirely behind the cutoff, never the straddling one.
+						if (new_first_valid_key <= ctx.end_key) {
 							ptr = atom_ptr.exchange(nullptr);
 							if (ptr) {
 								L_STASH("StashSlots::" + LIGHT_RED + "CLEAR" + CLEAR_COLOR + " - {}_Mod:{}, begin_key:{}, end_key:{}, cur:{}, limit_key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}, op:{}", ctx._col(), _Mod, ctx.begin_key, ctx.end_key, cur, limit_key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load(), ctx._op());
 								delete ptr;
 							}
-						} else {
+						}
+					} else {
+						auto status = ptr->next(ctx, value_ptr, new_first_valid_key);
+						if (status) {
 							L_STASH("StashSlots::" + FOREST_GREEN + "FOUND" + CLEAR_COLOR + " - {}_Mod:{}, begin_key:{}, end_key:{}, cur:{}, limit_key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}, op:{}", ctx._col(), _Mod, ctx.begin_key, ctx.end_key, cur, limit_key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load(), ctx._op());
 							found = true;
 							goto ret_next;
@@ -372,12 +377,10 @@ public:
 		auto& atom_ptr = *ptr_atom_ptr;
 		auto ptr = atom_ptr.load();
 		if (!ptr) {
-			auto tmp = new _Tp();
-			if (atom_ptr.compare_exchange_strong(ptr, tmp)) {
-				ptr = tmp;
-			} else {
-				delete tmp;
-			}
+			auto tmp = std::make_unique<_Tp>();
+			if (atom_ptr.compare_exchange_strong(ptr, tmp.get())) {
+				ptr = tmp.release();
+			}  // else: unique_ptr frees the loser (exception-safe)
 		}
 
 		ptr->put(ctx, key, std::forward<Args>(args)...);
@@ -502,12 +505,10 @@ public:
 		auto& atom_ptr = *ptr_atom_ptr;
 		auto ptr = atom_ptr.load();
 		if (!ptr) {
-			auto tmp = new _Tp(std::forward<Args>(args)...);
-			if (atom_ptr.compare_exchange_strong(ptr, tmp)) {
-				ptr = tmp;
-			} else {
-				delete tmp;
-			}
+			auto tmp = std::make_unique<_Tp>(std::forward<Args>(args)...);
+			if (atom_ptr.compare_exchange_strong(ptr, tmp.get())) {
+				ptr = tmp.release();
+			}  // else: unique_ptr frees the loser (exception-safe)
 		}
 	}
 };

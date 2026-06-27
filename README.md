@@ -214,14 +214,59 @@ c++ -std=c++17 -I. test/test.cc -o test/test && ./test/test
 
 The test prints `stash OK: walked 3 values in key order: 11 22 33` and exits 0.
 
+## Concurrency model & invariants
+
+`stash` is lock-free on the producer side and single-consumer on the read/reclaim
+side. Many threads may `add`/`put` concurrently; exactly **one** thread runs the
+three read-side operations, which must not run concurrently with each other:
+
+- **`walk`** moves the present forward: it drains and fires everything due, frees
+  the consumed leaf *values*, and advances `first_valid`. It does **not** free
+  structure.
+- **`peep`** is a read-only lookahead (find the soonest entry, e.g. to size a
+  sleep). It advances no cursor and frees nothing.
+- **`clean`** reclaims *structure*: it drops a slot's whole subtree once that
+  slot's window is entirely behind a safe cutoff. **`clean` is required** — with
+  no `clean` the structure grows without bound (each reused leaf's append cursor
+  never resets). It is a separate pass, by design, because it may only release
+  what is provably past the consumer and unreachable by producers.
+
+Correctness rests on these invariants, all of which the Xapiand scheduler
+satisfies:
+
+1. **One consumer.** A single thread runs `walk` then `clean` sequentially. Two
+   walkers, or `clean` concurrent with `walk`, is undefined behavior.
+2. **Producers never write the past.** Keys are clamped to `>= now`, so no
+   producer targets a slot the consumer has passed — except transiently at a slot
+   boundary (a producer that latched a slot just before the clock crossed it).
+3. **`clean` trails by a margin longer than any in-flight `add`.** The cutoff
+   (`now - margin` in the scheduler) covers that boundary case: a slot a margin in
+   the past is being touched by no one, so its subtree is dropped with no locks or
+   checks.
+4. **No scheduling near the wrap horizon.** Keys stay below the wheel span; the
+   overflow guard drops anything beyond it. Scheduling within a margin of the full
+   horizon would alias a future write onto a slot being reclaimed.
+
+Inside this envelope — one consumer, bounded rates, a margin longer than an
+operation, no near-horizon scheduling — `stash` is correct, and that is exactly
+how the scheduler uses it. **Outside it, this is not a general-purpose MPMC
+structure.** A synthetic hammer (many producers at extreme rates, a margin shorter
+than an operation, or scheduling at the horizon) can expose a small rate of lost
+entries via a boundary use-after-free, near-horizon aliasing, or a bounds-ordering
+strand under heavy contention. Making reclamation *certain* under arbitrary
+concurrency needs real safe-memory-reclamation (epoch / hazard pointers) plus a
+linearized insert/walk — a planned redesign, not a property of the current
+margin-based `clean`.
+
+`test/longevity.cc` demonstrates the reclamation (unbounded growth without
+`clean`, bounded with it); `test/concurrent.cc` exercises the envelope under
+producer/consumer contention with ASan/TSan.
+
 ## Notes & caveats
 
 - **Value type must be pointer-like** (bool-testable and dereferenceable, e.g.
-  `std::shared_ptr<T>`). The walk tests `*ptr && **ptr` (`stash.h:437`). Don't
-  store a value that is "zero/empty" as a live entry; it reads as absent.
-- **Single-consumer walk.** Many producers can `add`/`put` concurrently, but
-  the walk/peep/clean side mutates non-atomic cursors (`walk_cur`,
-  `clean_cur`) and is not safe for concurrent walkers.
+  `std::shared_ptr<T>`). The walk tests `*ptr && **ptr`. Don't store a value that
+  is "zero/empty" as a live entry; it reads as absent.
 
 ## Provenance
 

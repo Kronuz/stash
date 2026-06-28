@@ -14,6 +14,9 @@ the *shape* is what matters.
 - **`bench_structures`** uses 2,000,000 inserts; **`bench_scheduler`** uses
   1,000,000 (Asio allocates a full `steady_timer` per arm, and two million live
   timers is a lot of memory).
+- These numbers are on the current `stash.h` (post strand-fix, walk-based clean,
+  and the consumer cursor). The strand fix is what makes the convergent column
+  below slower than a plain queue — see the hand-off table.
 
 ## The one caveat that matters
 
@@ -22,9 +25,9 @@ heap's `O(log n)` at low thread counts far more than a real scheduler, which
 holds dozens to thousands of pending items, ever would. **So the robust signal
 here is the tail latency (`p99`) and the *shape* of the scaling, not the
 single-threaded throughput.** The heap's real problem is not its `log n`; it is
-that every producer waits behind one lock, which shows up as the `p99` column and
-as the way `asio::steady_timer`'s throughput goes *backwards* as threads are
-added.
+that every producer waits behind one lock, which shows up as the `p99` column.
+`asio::steady_timer` is the same story in a different shape: its throughput stops
+scaling under contention while its tail latency blows up roughly 40×.
 
 ## Data structure (`bench_structures`, 2,000,000 inserts)
 
@@ -35,36 +38,37 @@ latency underneath.
 
 | threads | 1 | 2 | 4 | 8 | 14 |
 | --- | --- | --- | --- | --- | --- |
-| **stash** | 2.09 | 2.54 | 3.63 | 4.95 | 5.85 |
-| stash p99 | 1.2µs | 1.8µs | 2.4µs | 3.5µs | 4.3µs |
-| heap (mutex) | 0.64 | 1.10 | 1.51 | 4.15 | 5.91 |
-| heap p99 | 21µs | 33µs | 42µs | 36µs | 55µs |
-| multimap (mutex) | 1.50 | 0.88 | 0.85 | 1.48 | 1.66 |
-| multimap p99 | 5µs | 25µs | 43µs | 77µs | 140µs |
+| **stash** | 1.99 | 2.52 | 3.44 | 4.86 | 5.85 |
+| stash p99 | 1.3µs | 1.9µs | 2.8µs | 3.8µs | 4.8µs |
+| heap (mutex) | 2.03 | 1.32 | 1.64 | 4.39 | 6.11 |
+| heap p99 | 13µs | 33µs | 46µs | 36µs | 45µs |
+| multimap (mutex) | 1.64 | 0.93 | 0.74 | 1.37 | 1.62 |
+| multimap p99 | 8µs | 31µs | 50µs | 78µs | 85µs |
 
 stash and the heap converge on throughput once a dozen threads contend, but the
-heap gets there with **10–18× the tail latency**, because its producers queue
+heap gets there with **10–16× the tail latency**, because its producers queue
 behind one lock. multimap is strictly worse.
 
 ### Hand-off / stress — convergent keys `now()` (Xapiand runs these inline, not via stash)
 
 | threads | 1 | 2 | 4 | 8 | 14 |
 | --- | --- | --- | --- | --- | --- |
-| **stash** | 3.21 | 4.42 | 5.29 | 6.81 | 7.45 |
-| stash p99 | 0.5µs | 0.7µs | 1.2µs | 1.8µs | 2.8µs |
-| deque (mutex) | 4.06 | 3.45 | 4.23 | 6.19 | 7.99 |
-| vyukov (lock-free MPSC) | 7.86 | 10.28 | 12.06 | 14.96 | 12.83 |
-| sharded (per-producer) | 3.58 | 11.76 | 21.55 | 31.41 | 46.93 |
-| heap (mutex) | 0.42 | 1.57 | 3.70 | 5.25 | 6.70 |
+| **stash** | 2.71 | 2.84 | 2.91 | 3.03 | 2.59 |
+| stash p99 | 0.7µs | 1.3µs | 2.3µs | 4.2µs | 8.7µs |
+| deque (mutex) | 3.75 | 3.24 | 3.90 | 5.77 | 8.11 |
+| vyukov (lock-free MPSC) | 7.02 | 9.80 | 10.65 | 14.75 | 12.77 |
+| sharded (per-producer) | 3.50 | 12.21 | 23.91 | 34.26 | 45.36 |
+| heap (mutex) | 3.83 | 2.68 | 3.15 | 5.30 | 6.69 |
 
-For pure many-to-one hand-off with no ordering, a **per-producer sharded queue**
-wins by a wide margin (47 vs stash's 7.5 at 14 threads) and scales almost
-linearly — it has no shared hot point. A single lock-free queue (Vyukov) funnels
-through one atomic exchange and saturates at ~13. stash sits at the ceiling of
-its two shared atomics (the leaf cursor and the valid-key bounds). This is *why*
-a sharded queue is the right tool for hand-off, and why stash is the wrong tool
-for it — but a queue cannot answer "what is due now," which is the job stash
-exists for.
+This is the one pattern stash is built to avoid, and it shows: when every key is
+`now()` every producer piles onto the same leaf, and the per-leaf COMMIT loop
+that makes reclamation lossless serializes them. stash is the **slowest** thing
+in this table — a **per-producer sharded queue** wins by a wide margin (45 vs
+stash's 2.6 at 14 threads) and scales almost linearly, a single lock-free queue
+(Vyukov) saturates at ~13, and even a plain mutex+deque (8) beats it. A queue is
+the right tool for hand-off; stash is the wrong one — but a queue cannot answer
+"what is due now," which is the job stash exists for, and which never produces
+this access pattern.
 
 ## Scheduler shoot-out (`bench_scheduler`, 1,000,000 arms)
 
@@ -75,31 +79,33 @@ arm timed tasks; one consumer fires them.
 
 | threads | 1 | 2 | 4 | 8 | 14 |
 | --- | --- | --- | --- | --- | --- |
-| **stash** | 2.17 | 2.69 | 3.76 | 5.22 | 6.09 |
-| stash p99 | 1.2µs | 1.8µs | 2.4µs | 3.6µs | 4.5µs |
-| heap (mutex) | 2.70 | 1.46 | 1.82 | 4.69 | 5.07 |
-| heap p99 | 7µs | 26µs | 33µs | 32µs | 40µs |
-| `asio::steady_timer` | 2.74 | 3.60 | 3.10 | 1.51 | 1.51 |
-| asio p99 | 0.6µs | 0.8µs | 7µs | 30µs | 59µs |
+| **stash** | 2.03 | 2.55 | 3.55 | 5.06 | 6.13 |
+| stash p99 | 1.3µs | 1.9µs | 2.7µs | 3.8µs | 4.8µs |
+| heap (mutex) | 2.07 | 1.34 | 1.94 | 3.86 | 5.55 |
+| heap p99 | 12µs | 30µs | 37µs | 36µs | 45µs |
+| `asio::steady_timer` | 3.68 | 2.73 | 2.33 | 3.39 | 4.45 |
+| asio p99 | 1.5µs | 9.3µs | 22µs | 36µs | 59µs |
 
 ### Convergent keys `now()`
 
 | threads | 1 | 2 | 4 | 8 | 14 |
 | --- | --- | --- | --- | --- | --- |
-| **stash** | 3.05 | 4.57 | 5.38 | 6.87 | 7.72 |
-| stash p99 | 0.5µs | 0.7µs | 1.2µs | 1.8µs | 2.7µs |
-| heap (mutex) | 4.40 | 2.84 | 3.42 | 5.16 | 6.10 |
-| heap p99 | 3µs | 11µs | 19µs | 29µs | 35µs |
-| `asio::steady_timer` | 4.79 | 4.85 | 3.19 | 1.59 | 1.62 |
-| asio p99 | 0.3µs | 0.5µs | 7µs | 25µs | 60µs |
+| **stash** | 2.72 | 2.85 | 2.93 | 3.01 | 2.61 |
+| stash p99 | 0.7µs | 1.3µs | 2.3µs | 4.2µs | 8.7µs |
+| heap (mutex) | 2.70 | 2.80 | 3.14 | 4.61 | 6.03 |
+| heap p99 | 7.5µs | 13µs | 21µs | 32µs | 39µs |
+| `asio::steady_timer` | 6.73 | 4.09 | 2.93 | 3.99 | 5.50 |
+| asio p99 | 1µs | 8.5µs | 20µs | 34µs | 54µs |
 
 `asio::steady_timer` is the **fastest of the three with one or two threads**, and
-the slowest by a wide margin once a handful contend: its throughput drops *below*
-its single-threaded number, because every `async_wait` serializes on the
-`io_context`'s lock. That negative scaling, not the average, is the reason the
-stash-backed scheduler wins for the load Xapiand actually puts on it. Asio
-remains the better choice when the timer load is light or you want its
-composition and cancellation machinery.
+then it stops scaling: under contention its throughput sags (it never beats its
+own one-thread number on the convergent load) while its tail latency climbs to
+~60µs, roughly 40× its single-thread tail, because every `async_wait` serializes
+on the `io_context`'s lock. The stash-backed scheduler does the opposite — it
+keeps climbing to 6.1 and holds a ~5µs tail. That tail gap, not the average, is
+why it wins the load Xapiand actually puts on it. Asio remains the better choice
+when the timer load is light or you want its composition and cancellation
+machinery.
 
 ## Notes
 

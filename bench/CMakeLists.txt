@@ -3,10 +3,12 @@
 #   cmake -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build
 #   ./build/bench_structures      # stash vs queues (no external deps)
+#   ./build/bench_steady          # bounded-depth arm latency (the queue-depth regime)
 #   ./build/bench_scheduler       # stash vs asio::steady_timer vs heap
 #
-# bench_structures has no dependencies beyond stash.h. bench_scheduler also
-# compares against asio::steady_timer, fetched standalone (header-only).
+# bench_structures has no dependencies beyond stash.h. bench_steady and
+# bench_scheduler also compare against asio::steady_timer, fetched standalone
+# (header-only).
 
 cmake_minimum_required(VERSION 3.16)
 project(stash_bench CXX)
@@ -40,3 +42,9 @@ add_executable(bench_scheduler bench_scheduler.cc)
 target_include_directories(bench_scheduler PRIVATE ${STASH_ROOT} ${asio_SOURCE_DIR}/asio/include)
 target_compile_definitions(bench_scheduler PRIVATE ASIO_STANDALONE)
 target_link_libraries(bench_scheduler PRIVATE Threads::Threads)
+
+# Bounded-depth arm-latency benchmark; also compares against asio::steady_timer
+# (the file defines ASIO_STANDALONE itself).
+add_executable(bench_steady bench_steady.cc)
+target_include_directories(bench_steady PRIVATE ${STASH_ROOT} ${asio_SOURCE_DIR}/asio/include)
+target_link_libraries(bench_steady PRIVATE Threads::Threads)

@@ -281,25 +281,36 @@ Correctness rests on:
 
 1. **One consumer.** A single thread runs `walk` then `clean` sequentially. Two
    walkers, or `clean` concurrent with `walk`, is undefined behavior.
-2. **The contiguous-frontier protocol.** `atom_ready` is the written frontier; the
-   walk reads up to it, never past a reserved-but-unwritten hole, and `pending_floor`
-   keeps reclamation from crossing a pending leaf. So the walk never skips a
-   reserved slot and `clean` never frees under an in-flight insert. (This is the
-   strand fix; see `STRAND_FIX.md`.)
+2. **The sentinel frontier.** Each slot encodes its own state: a reserved-but-
+   unfilled slot holds a sentinel, a filled slot a value, a drained slot null. A
+   chunk is sentinel-initialized before it is published, so the walk parks on the
+   first sentinel and never steps past it (it never skips a reserved slot), and
+   `pending_floor` keeps reclamation from crossing a pending leaf, so `clean` never
+   frees under an in-flight insert. (This replaced the earlier `atom_ready` COMMIT
+   loop; see `STRAND_FIX.md`.)
 3. **Insert latency below task lead time.** The bound and the `first_valid`
    lowering happen *during* `add`, so a task that becomes due in the brief window
-   *before* its insert publishes (the descent window) can be reclaimed before it
-   is visible. For any real schedule (leads of milliseconds and up against insert
-   latency of microseconds) this cannot happen; it surfaces only under a
-   sanitizer's slowdown driving inserts at a sub-millisecond leading edge.
+   *before* its insert publishes (the descent window) can be lost. For any real
+   schedule (leads of milliseconds and up against insert latency of microseconds)
+   this cannot happen; it surfaces only at a sub-millisecond leading edge, or under
+   extreme oversubscription where a preempted producer's effective latency exceeds
+   the lead. It is bounded loss, never a use-after-free.
+4. **A span the consumer can keep up with.** The wheel reuses each physical slot
+   every `Div*Mod` (one revolution). The single consumer must finish a `clean`
+   pass within one revolution. If it falls a full revolution behind (span far too
+   small for the offered load, or the consumer starved of CPU), a producer reusing
+   a slot aliases the previous wrap's live, not-yet-cleaned subtree while `clean`
+   frees it, which is a use-after-free. Size the span well above one clean pass.
+   This is standard for any hierarchical timer wheel; `horizon_margin` (below)
+   guards the adjacent near-horizon case.
 
-Inside this envelope (one consumer, insert latency below lead time) `stash`
-reclaims with **exact accounting and no time margin**: every entry fires exactly
-once, memory stays bounded, and there are no data races or use-after-free
-(ASan/TSan clean), including under thread oversubscription. `test/longevity.cc`
-demonstrates the reclamation (unbounded growth without `clean`, bounded with it);
-`test/concurrent.cc` proves the accounting under heavy producer/consumer
-contention.
+Inside this envelope (one consumer; insert latency below lead time; the span sized
+so `clean` is not lapped) `stash` reclaims with **exact accounting and no time
+margin**: every entry fires exactly once, memory stays bounded, and there are no
+data races or use-after-free (ASan/TSan clean), including under thread
+oversubscription. `test/longevity.cc` demonstrates the reclamation (unbounded
+growth without `clean`, bounded with it); `test/concurrent.cc` proves the
+accounting under heavy producer/consumer contention.
 
 This replaced an earlier **margin-based** `clean` (cutoff `now - margin`), which
 bought a wall-clock quiescence window for safety but, under load, reclaimed

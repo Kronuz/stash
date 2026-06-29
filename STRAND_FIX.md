@@ -264,13 +264,19 @@ and untouched. This is the original "clean as walking", and it needs no SMR.
 | 14        | 3771         | **0** |
 | 16        | ~3000        | **0** |
 
-Memory stays bounded (peak ~50–90 KB, no worse than the margin version). The only
+Memory stays bounded (peak ~50–90 KB, no worse than the margin version). The
 residual is the **descent window**: a task that becomes due in the window before
 its own insert publishes. It needs insert latency to exceed the task's lead time,
 so it cannot occur for any real schedule; at the extreme leading edge (≤8 ms lead)
-it is ~1 in millions plain, a handful under TSan's ~20× slowdown, and **0** as
-soon as the lead exceeds insert latency (verified: TSan, 16 ms lead, p=14 → 0 lost,
-0 races). We take it pure (no backstop margin); the precondition is documented.
+it is ~1 in millions plain.
+
+> **Correction (see "What the proof gate missed" below).** The "p=14 → 0 lost"
+> numbers in this section and the proof gate were produced by a harness that
+> grepped output for `FAIL` and so counted a SIGBUS/SIGSEGV (which prints nothing)
+> as a pass. At 8–14 producers on this 14-core host the test was in fact
+> *crashing*, on **every** version including the bare base — a wheel-wrap aliasing
+> use-after-free from the unrealistically small 64 ms span, not the descent window.
+> The corrected, crash-aware results are below.
 
 ### Sanitizer status
 
@@ -279,7 +285,9 @@ init; TSan segfaults at thread create — a 5-line `std::thread` program reprodu
 both, so it is the toolchain). **Homebrew LLVM 22** works and is what the proof
 gate below uses.
 
-Proof gate (`test/concurrent.cc`, walk-based clean, 14-core host):
+Proof gate (`test/concurrent.cc`, walk-based clean, 14-core host) — **superseded;
+the "0 lost" entries below were crash-as-pass artifacts, see "What the proof gate
+missed":**
 
 - plain, leading edge (lead 0), p=8/14/16: 0 lost (10/10 repeats at p=14), memory bounded
 - ASan, leading edge, p=14 and p=16: no use-after-free, 0 lost
@@ -344,3 +352,66 @@ schedulers and the logger run leads of milliseconds-to-seconds against
 microsecond inserts, so the window never opens; the trade buys the convergent
 speed for a residual that only widens in a regime that does not occur in
 production. We take it; the precondition stays documented.
+
+> **Correction.** The "branch loses ~25% more (19/20 vs 15/20)" claim above came
+> from the same crash-as-pass harness. Those runs were *crashing*, not losing, and
+> the crash was wheel-wrap aliasing shared by every version. See the next section
+> for the corrected, crash-aware comparison; the sentinel is in fact more correct
+> than the base, not less.
+
+## What the proof gate missed: wheel-wrap aliasing, not the descent window
+
+The verification above had two holes, and closing them changed the conclusion.
+
+The first hole was the harness. It decided pass/fail by grepping the test's output
+for `RESULT: OK` / `FAIL`. A SIGBUS or SIGSEGV prints nothing, so every crash read
+as a silent pass. Re-run counting any non-zero exit as a failure, the picture
+flips: at 8 to 14 producers on a 14-core host, `test/concurrent.cc` was *crashing*
+most runs, on the sentinel branch, on the strand-fixed main, and on the bare base
+alike. (The test now installs a fatal-signal handler that prints
+`RESULT: FAIL - crashed (fatal signal)`, so this can never recur.)
+
+The second hole was the test geometry. The wheel spanned 64 ms and wrapped about
+16 times a second. Under 8 or more producers the single consumer cannot finish a
+clean pass within one revolution, so a physical slot gets reused for a fresh key
+while the previous wrap's subtree is still live and uncleaned. The producer walks
+into that subtree (spawning a chunk) at the same moment `clean` frees it. ASan
+pins it exactly: a producer `compare_exchange` in `Data::get` writing a node that
+the consumer's `clean` (`StashSlots::next`) freed. This is **wheel-slot aliasing
+from undersizing the span**, a property of any hierarchical timer wheel, and it is
+present on every version. It has nothing to do with a task going due mid-insert.
+
+The fix is a sizing invariant, not a code change: **the consumer must complete a
+clean pass within one wheel revolution.** Give the wheel a span comfortably above
+one clean pass and the crash is gone. With a 4096 ms span (four levels, fine 1 ms
+buckets, no wrap during a multi-second run), crash-aware, 14 producers, x12:
+
+| 14 producers, big span | bare base | sentinel |
+|------------------------|-----------|----------|
+| supported (lead 16 ms) | 7/12 ok, 5 loss, **0 crash** | 11/12 ok, 1 loss, **0 crash** |
+| leading edge (lead 0)  | 9/12 ok, 3 loss, **0 crash** | 12/12 ok, 0 loss, **0 crash** |
+
+So once the wheel is sized right there are no crashes, and the sentinel frontier is
+not just faster on the convergent case, it is **more correct** under contention
+than the base: it sentinel-initializes a chunk before publishing it, so the walk
+parks on a reserved slot instead of stepping past an empty hole, and loses far
+less. ASan on the big span is clean in the supported regime (fired == added at 14
+producers); the only residual is a rare loss at extreme oversubscription (16
+threads on 14 cores), where a preempted producer's effective insert latency
+occasionally exceeds even a 16 ms lead. That is the documented descent window, now
+correctly attributed, and it is bounded loss, never a use-after-free.
+
+### The clean-side grace period, considered and dropped
+
+Before the aliasing was understood, the apparent "descent-window UAF" looked like a
+reclamation race to be closed by trailing `clean` behind real time by a grace
+margin (`clean` cutoff = `min(first_valid, now - SAFETY)`). Measured, it does not
+earn its place. On the correctly sized wheel the sentinel is already clean without
+it (12/12 at the leading edge, grace off), and a grace margin is neutral at best
+(`SAFETY` 8 ms: same 12/12) and harmful as it grows (16 ms: 11/12; a full `SPAN`:
+reintroduces aliasing by holding leaves a whole revolution). The grace margin
+fixes a freeing race; the residual is a *firing* miss, which no reclamation policy
+can fix. So we do not add it. If a future consumer ever runs at `lead < insert
+latency` on purpose, the right answer is to not route those keys through the wheel
+(an immediate path or a queue), the way Xapiand's logger already separates
+async-now from deferred-future.

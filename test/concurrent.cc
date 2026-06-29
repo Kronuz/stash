@@ -1,25 +1,40 @@
-// Concurrent safety proof for walk-based reclamation ("clean as walking").
+// Concurrent safety test for walk-based reclamation ("clean as walking").
 //
-// Many producer threads add() tasks at the leading edge (now + jitter) while one
-// consumer walks (drains+fires) and cleans, over a real-time wheel that wraps many
-// times. We assert every added task fires exactly once (a dropped-too-early
-// subtree shows up as a lost task) and run it under ASan / TSan for use-after-free
-// and data races.
+// Many producer threads add() tasks in a narrow band near now() while one
+// consumer walks (drains+fires) and cleans. Every added task must fire exactly
+// once (count + XOR); a leaf dropped while still in use shows up as loss, and a
+// reclaim racing a live producer shows up as a use-after-free under ASan.
 //
-// clean reclaims up to the walk's live low-water mark (first_valid) with NO
-// wall-clock margin. That is safe because the strand fix (atom_ready +
-// pending_floor) makes first_valid a true boundary: a leaf with any in-flight
-// insert pins it, and a late insert lowers it, so everything strictly below it
-// has been walked. The earlier now-margin cutoff dropped completed-but-overdue
-// tasks under load; walk-based clean does not. The only theoretical gap is the
-// descent window -- a task that becomes due *during* its own insert -- which
-// cannot occur once a task's lead time exceeds insert latency (always, in
-// practice); the `margin` arg now only pads the final drain window.
+// The load-bearing invariant here is a property of every hierarchical timer
+// wheel, not of this structure specifically: the consumer must complete a clean
+// pass within one wheel revolution. The wheel reuses each physical slot every
+// HORIZON_SPAN; if clean falls a full revolution behind -- span too small for the
+// offered load, or the single consumer starved of CPU -- a producer reusing a
+// slot aliases the live, not-yet-cleaned subtree from the previous wrap while
+// clean frees it. That is a use-after-free, and it is the failure that dominates
+// once you oversubscribe a tiny wheel (the old 64ms span wrapped ~16x/s and
+// aliased under 8+ producers; it was a sizing artifact, present on every version
+// of the code). So the wheel below is sized well above one clean pass (4096ms,
+// fine 1ms buckets) and does not lap the cleaner during a multi-second run.
 //
-// Build (see run script):
-//   plain + -DTRACK_MEM : accounting + bounded-memory check
-//   -fsanitize=address  : use-after-free / heap corruption
-//   -fsanitize=thread   : data races
+// clean reclaims up to the walk's live low-water mark (first_valid), no wall-clock
+// margin. first_valid is a safe boundary: a leaf with an in-flight insert pins it
+// (a chunk is sentinel-initialized before it is published, so the walk parks on
+// the reserved slot instead of passing an empty hole), and a late insert lowers
+// it. The residual is the descent window -- a task going due *during* its own
+// insert, only when insert latency exceeds the task's lead -- which costs at most
+// a rare lost task at the extreme leading edge and vanishes once lead > insert
+// latency. The `margin` arg pads the final drain window.
+//
+// A fatal signal self-reports "RESULT: FAIL (fatal signal)" so any runner counts
+// a crash as a failure: a SIGBUS/SIGSEGV that printed nothing used to read as a
+// pass to a grep-for-FAIL harness, which silently hid the aliasing crash.
+//
+// Build (header-only):
+//   c++ -std=c++20 -O2 -I. test/concurrent.cc
+//   + -DTRACK_MEM        : accounting + bounded-memory check
+//   + -fsanitize=address : use-after-free / heap corruption  (Homebrew LLVM)
+//   + -fsanitize=thread  : data races
 
 #include <atomic>
 #include <chrono>
@@ -30,6 +45,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <csignal>
+#include <unistd.h>
 
 #ifdef TRACK_MEM
 #include <new>
@@ -68,11 +85,31 @@ struct Task {
 };
 using TaskPtr = std::shared_ptr<Task>;
 
-// Real-time wheel, span = 8*8ms = 64ms, wraps ~16x/second.
-using Leaf = StashValues<TaskPtr, 8>;
-using L1   = StashSlots<Leaf, 8, 1ULL * MS, 8>;
-using Wheel = StashSlots<L1, 8, 8ULL * MS, 8>;
-static constexpr unsigned long long SPAN = 64ULL * MS;   // 8 * 8ms
+// Wheel sized so it does NOT lap the single cleaner during a multi-second run:
+// 4 levels, fine 1ms leaf buckets, structural span = 512ms * 8 = 4096ms (~4s).
+// The earlier two-level 64ms span wrapped ~16x/s and, under 8+ producers, the
+// consumer could not clean a full revolution in time -- a producer reusing a slot
+// then aliased a live subtree (a use-after-free). See the header note; shrinking
+// these levels back toward 64ms reproduces it.
+using Leaf  = StashValues<TaskPtr, 8>;
+using L1    = StashSlots<Leaf, 8, 1ULL * MS, 8>;     // 1ms buckets,  8ms span
+using L2    = StashSlots<L1, 8, 8ULL * MS, 8>;       // 8ms buckets,  64ms span
+using L3    = StashSlots<L2, 8, 64ULL * MS, 8>;      // 64ms buckets, 512ms span
+using Wheel = StashSlots<L3, 8, 512ULL * MS, 8>;     // 512ms buckets, 4096ms span
+static constexpr unsigned long long HORIZON_SPAN = 4096ULL * MS;  // one revolution
+static_assert(HORIZON_SPAN == 512ULL * MS * 8, "must match the wheel's top-level span");
+static constexpr unsigned long long HORIZON = 64ULL * MS;  // key jitter band + drain padding
+static_assert(HORIZON * 8 < HORIZON_SPAN, "key band must sit far inside one revolution");
+
+// A fatal signal (the aliasing UAF manifests as SIGSEGV/SIGBUS) prints a FAIL line
+// and exits non-zero, so it can never be miscounted as a pass. write() is the only
+// async-signal-safe output here; printf is not.
+static void crash_handler(int) {
+	static const char msg[] = "  RESULT: FAIL - crashed (fatal signal)\n";
+	ssize_t r = ::write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+	(void)r;
+	_Exit(134);
+}
 
 int main(int argc, char** argv) {
 	int nproducers = argc > 1 ? atoi(argv[1]) : 8;
@@ -88,7 +125,12 @@ int main(int argc, char** argv) {
 
 	// Unbuffered output (so nothing is lost on a crash) + a watchdog that turns an
 	// infinite loop (structural corruption) into a reported FAIL instead of a hang.
+	// A fatal-signal handler turns a crash (the aliasing UAF) into a reported FAIL
+	// too, so it is never miscounted as a pass.
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
+	std::signal(SIGSEGV, crash_handler);
+	std::signal(SIGBUS, crash_handler);
+	std::signal(SIGABRT, crash_handler);
 	double wd_secs = seconds + 12.0;
 	std::thread([wd_secs]() {
 		std::this_thread::sleep_for(std::chrono::duration<double>(wd_secs));
@@ -113,7 +155,7 @@ int main(int argc, char** argv) {
 
 	auto producer = [&](int tid) {
 		std::mt19937_64 rng(0x9E3779B97F4A7C15ULL ^ (uint64_t)tid);
-		std::uniform_int_distribution<unsigned long long> jitter(0, SPAN / 8);   // small horizon: jitter+margin << span (no aliasing)
+		std::uniform_int_distribution<unsigned long long> jitter(0, HORIZON / 8);   // narrow key band (8ms), far inside one revolution
 		while (phase.load(std::memory_order_acquire) == 0) {
 			uint64_t id = uid_gen.fetch_add(1, std::memory_order_relaxed);
 			auto t = std::make_shared<Task>(id);
@@ -163,7 +205,7 @@ int main(int argc, char** argv) {
 		// bounded wall-clock window long enough that every scheduled task is due.
 		// Bounded so a lost/stuck task reports as a loss instead of hanging.
 		while (!producers_done.load(std::memory_order_acquire)) {}
-		auto drain_until = now_ns() + 3ULL * SPAN + margin;
+		auto drain_until = now_ns() + 3ULL * HORIZON + margin;
 		while (now_ns() < drain_until) {
 			ctx.op = StashContext::Operation::walk;
 			ctx.pending_floor = StashContext::IDLE;   // Step 3: fresh per walk

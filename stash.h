@@ -25,6 +25,7 @@
 #include <array>                 // for std::array
 #include <atomic>                // for std::atomic
 #include <cassert>               // for assert
+#include <cstdint>               // for uintptr_t
 #include <limits>                // for std::numeric_limits
 #include <memory>                // for std::unique_ptr / std::make_unique
 
@@ -53,6 +54,15 @@ enum class StashState : uint8_t {
 	StashShort,
 	StashEmpty,
 };
+
+
+// A leaf slot reserved by a producer but not yet filled holds this sentinel,
+// distinct from null (drained) and from a real value pointer. It is never
+// dereferenced; the walk stops on it instead of stepping past the hole.
+template <typename T>
+inline T* stash_reserved() noexcept {
+	return reinterpret_cast<T*>(~static_cast<uintptr_t>(0));
+}
 
 
 struct StashContext {
@@ -145,7 +155,7 @@ struct StashContext {
 };
 
 
-template <typename _Tp, size_t _Size>
+template <typename _Tp, size_t _Size, bool _Reserved = false>
 class Stash {
 protected:
 	class Data;
@@ -188,7 +198,7 @@ protected:
 				if (chunk) {
 					for (auto& atom_ptr : *chunk) {
 						auto ptr = atom_ptr.exchange(nullptr, std::memory_order_relaxed);
-						if (ptr) {
+						if (ptr && ptr != stash_reserved<_Tp>()) {
 							delete ptr;
 						}
 					}
@@ -253,6 +263,15 @@ protected:
 					return StashState::ChunkEmpty;
 				}
 				auto tmp = std::make_unique<Chunks>();
+				if constexpr (_Reserved) {
+					// Mark every slot reserved before publishing the array, so a
+					// consumer that acquires the chunk can tell a not-yet-filled slot
+					// (sentinel) from a drained one (null). relaxed: these stores are
+					// ordered before the array by the release-CAS that publishes it.
+					for (auto& a : *tmp) {
+						a.store(stash_reserved<_Tp>(), std::memory_order_relaxed);
+					}
+				}
 				// release publishes the new chunk array; acquire on failure loads the
 				// winner so the slots we hand out are the published ones.
 				if (_data->atom_chunk.compare_exchange_strong(chunk, tmp.get(),
@@ -499,14 +518,18 @@ public:
 
 
 template <typename _Tp, size_t _Size>
-class StashValues : public Stash<_Tp, _Size> {
-	using Stash_T = Stash<_Tp, _Size>;
+class StashValues : public Stash<_Tp, _Size, true> {
+	using Stash_T = Stash<_Tp, _Size, true>;
 
-	size_t walk_cur;
+	size_t walk_cur;                 // resume frontier: parks on the first reserved
+	                                 // (sentinel) slot. Everything below it is drained
+	                                 // (null); the walk drains ready values beyond it
+	                                 // but never steps it past an unfilled hole, so the
+	                                 // leaf stays pinned until the hole fills.
 	size_t clean_cur;
-	std::atomic_size_t atom_end;     // producer reserve frontier (next slot to claim)
-	std::atomic_size_t atom_ready;   // contiguous written frontier (<= atom_end);
-	                                 // slots [0, atom_ready) are guaranteed written
+	std::atomic_size_t atom_end;     // producer reserve frontier (next slot to claim).
+	                                 // A slot is reserved (sentinel), filled (a value),
+	                                 // or drained (null); the walk reads which directly.
 	typename Stash_T::Cursor walk_cursor;    // consumer scan resume points (single
 	typename Stash_T::Cursor clean_cursor;   // consumer; each tracks its own cur)
 
@@ -515,100 +538,115 @@ public:
 		: Stash_T::Stash(std::move(o)),
 		  walk_cur(std::move(o.walk_cur)),
 		  clean_cur(std::move(o.clean_cur)),
-		  atom_end(o.atom_end.load()),
-		  atom_ready(o.atom_ready.load()) { }
+		  atom_end(o.atom_end.load()) { }
 
 	StashValues()
 		: walk_cur(0),
 		  clean_cur(0),
-		  atom_end(0),
-		  atom_ready(0) { }
+		  atom_end(0) { }
 
 	template <typename T>
 	bool next(StashContext& ctx, T* value_ptr, unsigned long long) {
-		auto cur = (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur;
+		const auto sentinel = stash_reserved<_Tp>();
+		const bool is_clean = (ctx.op == StashContext::Operation::clean);
+		const bool is_walk = (ctx.op == StashContext::Operation::walk);
+		const bool is_peep = (ctx.op == StashContext::Operation::peep);
 
 		// Resume the chain walk from this op's cursor. peep is read-only lookahead
 		// and must not perturb the persistent walk cursor, so it uses a throwaway.
 		typename Stash_T::Cursor peep_cursor;
-		auto& cursor = (ctx.op == StashContext::Operation::walk)  ? walk_cursor
-		             : (ctx.op == StashContext::Operation::clean) ? clean_cursor
-		             :                                              peep_cursor;
+		auto& cursor = is_walk  ? walk_cursor
+		             : is_clean ? clean_cursor
+		             :            peep_cursor;
 
-		auto loop = cur < ((ctx.op == StashContext::Operation::clean) ? walk_cur : atom_ready.load());
-
-		while (loop) {
-			auto new_cur = cur + 1;
-
-			L_DEBUG_HOOK("StashValues::LOOP", "StashValues::" + LIGHT_SKY_BLUE + "LOOP" + CLEAR_COLOR + " - {}cur:{}, cur:{}, atom_end:{}, op:{}", ctx._col(), cur, (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur, atom_end.load(), ctx._op());
-
-			std::atomic<_Tp*>* ptr_atom_ptr = nullptr;
-			switch (Stash_T::get(&ptr_atom_ptr, cur, false, cursor)) {
-				case StashState::Ok:
+		if (is_clean) {
+			// Sweep the drained prefix [clean_cur, walk_cur): every slot there is
+			// null (the walk drained it), so just advance the reclaim cursor.
+			while (clean_cur < walk_cur) {
+				std::atomic<_Tp*>* p = nullptr;
+				if (Stash_T::get(&p, clean_cur, false, cursor) != StashState::Ok) {
 					break;
-				case StashState::ChunkEmpty:
-					L_STASH("StashValues::" + SADDLE_BROWN + "EMPTY" + CLEAR_COLOR + " - {}cur:{}, cur:{}, atom_end:{}, op:{}", ctx._col(), cur, (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur, atom_end.load(), ctx._op());
-					break;
-				case StashState::StashShort:
-				case StashState::StashEmpty:
-					L_STASH("StashValues::" + SADDLE_BROWN + "BREAK" + CLEAR_COLOR + " - {}cur:{}, cur:{}, atom_end:{}, op:{}", ctx._col(), cur, (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur, atom_end.load(), ctx._op());
-					return false;
-			}
-
-			loop = new_cur < ((ctx.op == StashContext::Operation::clean) ? walk_cur : atom_ready.load());
-
-			if (loop) {
-				switch (ctx.op) {
-					case StashContext::Operation::peep:
-						cur = new_cur;
-						break;
-					case StashContext::Operation::walk:
-						cur = walk_cur = new_cur;
-						break;
-					case StashContext::Operation::clean:
-						cur = clean_cur = new_cur;
-						break;
 				}
+				++clean_cur;
 			}
-
-			if (ptr_atom_ptr) {
-				auto& atom_ptr = *ptr_atom_ptr;
-				auto ptr = atom_ptr.load(std::memory_order_acquire);   // see the filled value
-				if (ptr) {
-					bool returning = false;
-					if (ctx.op != StashContext::Operation::clean) {
-						if (*ptr && **ptr) {
-							L_STASH("StashValues::" + LIGHT_GREEN + "FOUND" + CLEAR_COLOR + " - {}cur:{}, cur:{}, atom_end:{}, op:{}", ctx._col(), cur, (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur, atom_end.load(), ctx._op());
-							if (value_ptr) {
-								*value_ptr = *ptr;
-							}
-							returning = true;
-						}
-					}
-					if (ctx.op != StashContext::Operation::peep) {
-						// acquire: own the value before firing/deleting it.
-						ptr = atom_ptr.exchange(nullptr, std::memory_order_acquire);
-						if (ptr) {
-							L_STASH("StashValues::" + LIGHT_RED + "CLEAR" + CLEAR_COLOR + " - {}cur:{}, cur:{}, atom_end:{}, op:{}", ctx._col(), cur, (ctx.op == StashContext::Operation::clean) ? clean_cur : walk_cur, atom_end.load(), ctx._op());
-							delete ptr;
-						}
-					}
-					if (returning) {
-						return true;
-					}
-				}
-			}
+			return false;
 		}
 
-		// Step 3: this leaf is exhausted up to atom_ready. If atom_ready < atom_end
-		// it is *pending* -- a producer reserved a slot here but has not filled it
-		// (and the contiguous frontier hides any slots filled behind that hole).
-		// Record this leaf's key as a floor; the wheel refuses to advance
-		// first_valid past it, so the held-back tail is re-drained next pass rather
-		// than reclaimed out from under the stalled producer. Walk only: peep is
-		// read-only, and clean runs strictly behind walk_cur where there are no holes.
-		if (ctx.op == StashContext::Operation::walk &&
-		    atom_ready.load(std::memory_order_acquire) < atom_end.load(std::memory_order_acquire)) {
+		// RMW read of the reserve frontier (fetch_add 0), not a plain load: an RMW is
+		// serialized in atom_end's modification order, so it reads the latest count
+		// and never a coherence-stale one. A stale bound would let the walk miss a
+		// reserved slot and reclaim the leaf out from under a producer.
+		const auto end = atom_end.fetch_add(0, std::memory_order_acquire);
+
+		// Scan from the resume cursor. Drain ready values and skip drained (null)
+		// slots, but PARK walk_cur on the first reserved hole and never step it past
+		// one -- that hole is where the next walk resumes, and it keeps the leaf
+		// pinned until the producer fills it. Ready values BEYOND the hole are still
+		// drained, so one slow producer cannot stall the rest of the leaf.
+		size_t cur = walk_cur;
+		bool parked = false;
+		while (cur < end) {
+			std::atomic<_Tp*>* ptr_atom_ptr = nullptr;
+			if (Stash_T::get(&ptr_atom_ptr, cur, false, cursor) != StashState::Ok) {
+				// Reserved but not yet materialized: a hole. Park here and stop;
+				// nothing beyond it can be materialized either.
+				parked = true;
+				break;
+			}
+
+			auto& atom_ptr = *ptr_atom_ptr;
+			auto ptr = atom_ptr.load(std::memory_order_acquire);
+
+			if (ptr == sentinel) {
+				// A reserved hole: park walk_cur on the first one, but keep scanning
+				// past it for ready values.
+				parked = true;   // park walk_cur on the first hole
+				++cur;
+				continue;
+			}
+
+			if (ptr == nullptr) {
+				// Already drained: skip. Advance the parked frontier only while it is
+				// still contiguous (we have not yet hit a hole).
+				if (!parked && is_walk) { walk_cur = cur + 1; }
+				++cur;
+				continue;
+			}
+
+			// A ready value.
+			if (is_peep) {
+				// Lookahead: report the value without taking it or moving the cursor.
+				if (*ptr && **ptr) {
+					if (value_ptr) { *value_ptr = *ptr; }
+					return true;
+				}
+				++cur;
+				continue;
+			}
+
+			// walk: take the value with an atomic exchange (not a plain store) so a
+			// concurrent reclaim cannot grab the same pointer and double-free it; only
+			// the winner of the exchange derefs and deletes it.
+			if (!parked) { walk_cur = cur + 1; }   // advance the contiguous front
+			ptr = atom_ptr.exchange(nullptr, std::memory_order_acquire);
+			if (ptr == nullptr || ptr == sentinel) {
+				++cur;   // lost the take, or not a real value
+				continue;
+			}
+			if (*ptr && **ptr) {
+				if (value_ptr) { *value_ptr = *ptr; }
+				delete ptr;
+				return true;
+			}
+			delete ptr;
+			++cur;
+		}
+
+		// The leaf is pending if walk_cur parked on a hole (a reserved-not-yet-filled
+		// slot) or producers reserved more slots after the scan began: undrained
+		// slots remain below the reserve frontier, so the wheel must keep the leaf
+		// pinned (capping first_valid) until the next walk drains them.
+		if (is_walk && (parked || walk_cur < atom_end.fetch_add(0, std::memory_order_acquire))) {
 			if (ctx.begin_key < ctx.pending_floor) {
 				ctx.pending_floor = ctx.begin_key;
 			}
@@ -632,11 +670,12 @@ public:
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
 		// `key`. Doing this *before* the fill is the crux of Step 2 -- it lets the
-		// walk descend to this leaf while the slot is still a hole and observe it
-		// as pending (atom_ready < atom_end), so Step 3 can pin first_valid to it.
-		// Publishing after the fill (where these two CAS loops used to live, at the
-		// end of StashSlots::add) would hide the pending state and let the
-		// consumer's low-water mark run past an in-flight insert.
+		// walk descend to this leaf while the slot is still a reserved hole and
+		// observe it as pending (walk_cur parks on the sentinel, walk_cur < atom_end),
+		// so the wheel pins first_valid to it. Publishing after the fill (where these
+		// two CAS loops used to live, at the end of StashSlots::add) would hide the
+		// pending state and let the consumer's low-water mark run past an in-flight
+		// insert.
 		// release on success: the bound is the leaf's publication point. Acquiring
 		// it (check(), ret_next, the R2 horizon) orders the reader after the path
 		// built during descent and after this slot's reserve.
@@ -650,50 +689,24 @@ public:
 		           std::memory_order_release, std::memory_order_relaxed));
 
 		// FILL: publish the value into the reserved slot. Only this producer writes
-		// this slot (the reserve made it private), so the null-check load is relaxed;
-		// the CAS releases so a consumer that later reads it past atom_ready -- or
-		// another producer's COMMIT -- sees the value fully constructed.
+		// this slot (the reserve made it private), and the slot was initialized to the
+		// reserved sentinel when its chunk was spawned. The CAS over the sentinel
+		// releases so a consumer that later reads this slot sees the value fully
+		// constructed. There is no commit step: the walk reads each slot's state
+		// (sentinel / value / null) directly and stops at the first sentinel, so a
+		// producer never advances a shared frontier on behalf of others.
 		auto& atom_ptr = *ptr_atom_ptr;
 		auto ptr = atom_ptr.load(std::memory_order_relaxed);
-		if (!ptr) {
+		if (ptr == stash_reserved<_Tp>()) {
 			auto tmp = std::make_unique<_Tp>(std::forward<Args>(args)...);
 			if (atom_ptr.compare_exchange_strong(ptr, tmp.get(),
 			        std::memory_order_release, std::memory_order_relaxed)) {
 				ptr = tmp.release();
 			}  // else: unique_ptr frees the loser (exception-safe)
 		}
-
-		// COMMIT: advance atom_ready over the contiguous *written* prefix, but only
-		// up to the reserve frontier observed *now*. Snapshotting atom_end bounds
-		// the loop -- re-reading it each iteration lets one producer chase an
-		// ever-growing reserve count under load and never terminate (a livelock).
-		// Whoever fills the slot that closes a gap drags the frontier past every
-		// slot already written behind it; a hole stops the advance until its own
-		// producer fills it (out-of-order fills handled exactly). Slots reserved
-		// after this snapshot are advanced by their own producers' COMMIT passes.
-		auto end = atom_end.load(std::memory_order_acquire);
-		auto r = atom_ready.load(std::memory_order_acquire);
-		while (r < end) {
-			std::atomic<_Tp*>* rp;
-			if (r == slot) {
-				// The slot we just filled. Reuse the pointer we already hold instead
-				// of re-walking the chunk chain (get() is O(slot/_Size)). This is no
-				// less safe than the fill above, which dereferences the same pointer:
-				// both run in put() after the bound is published, and if the descent
-				// window frees this leaf the loads of atom_end/atom_ready above fault
-				// first -- identically with or without this fast path.
-				rp = ptr_atom_ptr;
-			} else if (Stash_T::get(&rp, r, false) != StashState::Ok || !rp) {
-				break;
-			}
-			if (!rp->load(std::memory_order_acquire)) {
-				break;   // slot r not written yet (a hole); its producer will advance it
-			}
-			if (atom_ready.compare_exchange_weak(r, r + 1,
-			        std::memory_order_acq_rel, std::memory_order_acquire)) {
-				++r;
-			}  // else: r reloaded to the current frontier; retry (still < end)
-		}
+		// No commit step and no extra publish: the FILL's release CAS publishes the
+		// value, and the consumer reads atom_end with an RMW (always fresh) plus each
+		// slot with acquire, so it sees both the reservation and the value.
 	}
 };
 

@@ -332,6 +332,30 @@ Leave it 0 unless you schedule within one period of the full span (for example
   `std::shared_ptr<T>`). The walk tests `*ptr && **ptr`. Don't store a value that
   is "zero/empty" as a live entry; it reads as absent.
 
+## Examples
+
+[`examples/demo.cc`](examples/demo.cc) is a runnable tour of the data structure
+itself. A top-level CMake build produces it next to the test:
+
+```sh
+cmake -B build && cmake --build build && ./build/stash_demo
+```
+
+It builds a two-level wheel over a leaf and walks through the core moves: how a
+key descends to a leaf slot via `(key / Div) % Mod` at each level; `add`ing
+values at scattered offsets (including two at the same key, kept in insertion
+order by the append-only leaf); `peep`ing the soonest entry without consuming
+it; `walk`ing a key window so it drains in key order and skips the empty
+stretches; the horizon guard rejecting a key one full span out; and a small
+deterministic producer/consumer that shows the lock-free insert path (many
+`add`s, one consumer draining every value exactly once). The output is the same
+every run.
+
+[`examples/colored_trace/`](examples/colored_trace/) is the other example: it
+injects a trace header that turns `stash`'s no-op tracing hooks into colored,
+`std::format`-rendered trace lines, showing how a consumer recovers full debug
+tracing without editing `stash.h`. See its [README](examples/colored_trace/README.md).
+
 ## Provenance
 
 Extracted from [Xapiand](https://github.com/Kronuz/Xapiand), where it is the

@@ -634,25 +634,32 @@ public:
 			}
 
 			// A ready value.
-			bool valid = (*ptr && **ptr);
 			if (is_peep) {
-				if (valid) {
+				// Lookahead: report the value without taking it or moving the cursor.
+				if (*ptr && **ptr) {
 					if (value_ptr) { *value_ptr = *ptr; }
-					return true;   // lookahead: found one; do not drain or move cursor
+					return true;
 				}
 				++cur;
 				continue;
 			}
 
-			// walk: fire (if valid) and drain to null.
+			// walk: take the value with an atomic exchange (not a plain store) so a
+			// concurrent reclaim cannot grab the same pointer and double-free it; only
+			// the winner of the exchange derefs and deletes it.
 			if (!parked) { walk_cur = cur + 1; }   // advance the contiguous front
-			if (valid && value_ptr) { *value_ptr = *ptr; }
-			atom_ptr.store(nullptr, std::memory_order_release);
-			delete ptr;
-			if (valid) {
+			ptr = atom_ptr.exchange(nullptr, std::memory_order_acquire);
+			if (ptr == nullptr || ptr == sentinel) {
+				++cur;   // lost the take, or not a real value
+				continue;
+			}
+			if (*ptr && **ptr) {
+				if (value_ptr) { *value_ptr = *ptr; }
+				delete ptr;
 				DBG(dbg_fire);
 				return true;
 			}
+			delete ptr;
 			DBG(dbg_drain_invalid);
 			++cur;
 		}

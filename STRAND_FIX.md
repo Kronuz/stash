@@ -288,3 +288,59 @@ Proof gate (`test/concurrent.cc`, walk-based clean, 14-core host):
 The scheduler adopts the same one-line change (`clean` cutoff = `first_valid`,
 `pending_floor` reset per walk, R1 margin and R2 keep-out removed); its
 `test/test.cc` passes plain and under ASan.
+
+## Sentinel frontier: the COMMIT loop comes out
+
+The strand fix above kept a producer-maintained `atom_ready` (the contiguous
+*written* frontier) advanced by a per-insert COMMIT loop. That loop is the whole
+cost of the convergent case: every producer landing on the same leaf CASes the
+one shared `atom_ready`, and a hole stalls the advance (head-of-line blocking).
+
+The replacement encodes a slot's state in the slot itself, three ways:
+
+- **reserved / fresh** = a `-1` sentinel (chunks are sentinel-initialized before
+  they are linked),
+- **filled** = a real value pointer,
+- **drained** = `null`.
+
+Producers just reserve (`atom_end++`) and fill (`CAS(-1 -> value)`) — no COMMIT
+loop, no shared frontier to advance. The consumer's walk reads each slot's state
+directly: it drains ready values and skips drained (`null`) ones, **parks
+`walk_cur` on the first `-1` hole and never steps it past one** (that is where the
+next walk resumes and what keeps the leaf pinned), but it *does* drain ready
+values **past** the hole so one slow producer can't stall the rest of the leaf.
+`pending = parked-on-a-hole || walk_cur < atom_end` (RMW read of `atom_end`, so
+never coherence-stale). `clean` sweeps `[clean_cur, walk_cur)`.
+
+The first attempt *stopped* the walk at the first hole and used `cur < atom_end`
+for pending; that collapsed the safety lag and lost ~33% under contention. Draining
+past the hole while parking the frontier on it is the correct shape.
+
+### What it buys, and what it costs
+
+Benchmarked (M-series, `-O3`, best of the bench's internal repeats):
+
+- **Convergent (hand-off): ~2.85x throughput at 14 threads** (2.60 → 7.41 M/s)
+  and **~3.3x tighter p99** (8.7µs → 2.6µs). The case where stash was *worst* is
+  now competitive: above the heap, tied with a locked deque, still behind a
+  sharded queue (the right tool for pure hand-off).
+- **Spread (the real scheduler pattern): neutral to better** — equal throughput,
+  tighter tail at high thread counts (8µs → 5.25µs p99 at 14 threads).
+
+The cost is a **wider descent window**. `atom_ready` (committed frontier) lagged
+the reserve frontier by the whole reserve→fill→commit span; the sentinel walk
+drains to the reserve frontier, so `first_valid` rides closer to "now" and can
+reach an in-flight key sooner. Measured against main (`test/concurrent.cc`, x20):
+
+- supported regime (lead > insert latency: 4 producers; 14 producers / big
+  margin; longevity; unit): **0 loss, identical to main**;
+- the synthetic knife's-edge regime (8 producers, consumer barely keeping up,
+  near-zero lead): both lose to the descent window, the branch **~25% more**
+  (19/20 vs 15/20, 2x max loss);
+- sanitizers: the same descent-window race/UAF as main, **no new ones**.
+
+The precondition is unchanged from the strand fix: `lead > insert_latency`. Real
+schedulers and the logger run leads of milliseconds-to-seconds against
+microsecond inserts, so the window never opens; the trade buys the convergent
+speed for a residual that only widens in a regime that does not occur in
+production. We take it; the precondition stays documented.

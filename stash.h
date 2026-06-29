@@ -64,20 +64,6 @@ inline T* stash_reserved() noexcept {
 	return reinterpret_cast<T*>(~static_cast<uintptr_t>(0));
 }
 
-#ifdef STASH_DBG
-#include <cstdio>
-inline std::atomic<long> dbg_fill_ok{0}, dbg_fill_skip{0}, dbg_fire{0}, dbg_drain_invalid{0},
-	dbg_stop_sentinel{0}, dbg_stop_notok{0}, dbg_skip_null{0}, dbg_pending{0}, dbg_reclaim{0};
-__attribute__((destructor)) static void dbg_print() {
-	fprintf(stderr, "[DBG] fill_ok=%ld fill_skip=%ld fire=%ld drain_invalid=%ld stop_sentinel=%ld stop_notok=%ld skip_null=%ld pending=%ld reclaim_undrained=%ld\n",
-		dbg_fill_ok.load(), dbg_fill_skip.load(), dbg_fire.load(), dbg_drain_invalid.load(),
-		dbg_stop_sentinel.load(), dbg_stop_notok.load(), dbg_skip_null.load(), dbg_pending.load(), dbg_reclaim.load());
-}
-#define DBG(x) (x).fetch_add(1, std::memory_order_relaxed)
-#else
-#define DBG(x) ((void)0)
-#endif
-
 
 struct StashContext {
 	enum class Operation : uint8_t {
@@ -213,7 +199,6 @@ protected:
 					for (auto& atom_ptr : *chunk) {
 						auto ptr = atom_ptr.exchange(nullptr, std::memory_order_relaxed);
 						if (ptr && ptr != stash_reserved<_Tp>()) {
-							if constexpr (_Reserved) { DBG(dbg_reclaim); }
 							delete ptr;
 						}
 					}
@@ -605,7 +590,6 @@ public:
 			if (Stash_T::get(&ptr_atom_ptr, cur, false, cursor) != StashState::Ok) {
 				// Reserved but not yet materialized: a hole. Park here and stop;
 				// nothing beyond it can be materialized either.
-				if (is_walk) { DBG(dbg_stop_notok); }
 				parked = true;
 				break;
 			}
@@ -616,10 +600,7 @@ public:
 			if (ptr == sentinel) {
 				// A reserved hole: park walk_cur on the first one, but keep scanning
 				// past it for ready values.
-				if (!parked) {
-					if (is_walk) { DBG(dbg_stop_sentinel); }
-					parked = true;
-				}
+				parked = true;   // park walk_cur on the first hole
 				++cur;
 				continue;
 			}
@@ -628,7 +609,6 @@ public:
 				// Already drained: skip. Advance the parked frontier only while it is
 				// still contiguous (we have not yet hit a hole).
 				if (!parked && is_walk) { walk_cur = cur + 1; }
-				if (is_walk) { DBG(dbg_skip_null); }
 				++cur;
 				continue;
 			}
@@ -656,11 +636,9 @@ public:
 			if (*ptr && **ptr) {
 				if (value_ptr) { *value_ptr = *ptr; }
 				delete ptr;
-				DBG(dbg_fire);
 				return true;
 			}
 			delete ptr;
-			DBG(dbg_drain_invalid);
 			++cur;
 		}
 
@@ -669,7 +647,6 @@ public:
 		// slots remain below the reserve frontier, so the wheel must keep the leaf
 		// pinned (capping first_valid) until the next walk drains them.
 		if (is_walk && (parked || walk_cur < atom_end.fetch_add(0, std::memory_order_acquire))) {
-			DBG(dbg_pending);
 			if (ctx.begin_key < ctx.pending_floor) {
 				ctx.pending_floor = ctx.begin_key;
 			}
@@ -693,11 +670,12 @@ public:
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
 		// `key`. Doing this *before* the fill is the crux of Step 2 -- it lets the
-		// walk descend to this leaf while the slot is still a hole and observe it
-		// as pending (atom_ready < atom_end), so Step 3 can pin first_valid to it.
-		// Publishing after the fill (where these two CAS loops used to live, at the
-		// end of StashSlots::add) would hide the pending state and let the
-		// consumer's low-water mark run past an in-flight insert.
+		// walk descend to this leaf while the slot is still a reserved hole and
+		// observe it as pending (walk_cur parks on the sentinel, walk_cur < atom_end),
+		// so the wheel pins first_valid to it. Publishing after the fill (where these
+		// two CAS loops used to live, at the end of StashSlots::add) would hide the
+		// pending state and let the consumer's low-water mark run past an in-flight
+		// insert.
 		// release on success: the bound is the leaf's publication point. Acquiring
 		// it (check(), ret_next, the R2 horizon) orders the reader after the path
 		// built during descent and after this slot's reserve.
@@ -724,10 +702,7 @@ public:
 			if (atom_ptr.compare_exchange_strong(ptr, tmp.get(),
 			        std::memory_order_release, std::memory_order_relaxed)) {
 				ptr = tmp.release();
-				DBG(dbg_fill_ok);
 			}  // else: unique_ptr frees the loser (exception-safe)
-		} else {
-			DBG(dbg_fill_skip);
 		}
 		// No commit step and no extra publish: the FILL's release CAS publishes the
 		// value, and the consumer reads atom_end with an RMW (always fresh) plus each

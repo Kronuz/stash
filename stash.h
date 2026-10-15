@@ -28,6 +28,7 @@
 #include <cstdint>               // for uintptr_t
 #include <limits>                // for std::numeric_limits
 #include <memory>                // for std::unique_ptr / std::make_unique
+#include <stdexcept>             // for std::out_of_range
 
 // Tracing and coloring are optional and fully injectable. Define
 // STASH_TRACE_HEADER (a header path) before including this file to plug in your

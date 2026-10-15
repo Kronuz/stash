@@ -1,5 +1,7 @@
 # stash
 
+[![CI](https://github.com/Kronuz/stash/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/stash/actions/workflows/ci.yml)
+
 A lock-free, hierarchical **slot store** — the data structure underneath a
 multi-resolution timer wheel.
 

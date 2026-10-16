@@ -31,7 +31,7 @@ The `stash` target (alias `stash::stash`) is an `INTERFACE` library requesting
 `cxx_std_17`. CTest runs `stash_test`, which prints
 `stash OK: walked 3 values in key order: 11 22 33`.
 
-`test/concurrent.cc` runs in CTest as `stash_concurrent` (4 producers, 2 s), so the
+`test/concurrent.cc` runs in CTest as `stash_concurrent` (4 producers, 2 s, 20 ms lead), so the
 CI sanitizer jobs cover reclamation; run it longer by hand with
 `build/stash_concurrent PRODUCERS SECONDS`. `test/longevity.cc` is a manual tool (it
 replaces global `new`, so not under ASan, and always exits 0):
@@ -119,3 +119,12 @@ with Xapiand's `log.h` and color palette replaced by the injectable trace hooks.
 Since the extraction it gained the sentinel frontier and walk-based `clean`
 ([STRAND_FIX.md](STRAND_FIX.md)). Keep extraction hygiene separate from algorithm
 changes so the two can be reconciled with Xapiand.
+
+## Known defect: the descent window loses tasks under contention
+
+A task that comes due while its own insert is still descending can be skipped by the
+walk. `concurrent.cc` reproduces it with no lead: pinned to two cores on Linux
+(`taskset -c 0,1 stash_concurrent 4 2.0 32 0 0`), five of five runs lost 206 to 347
+of about 300,000 tasks; with a 20 ms lead, none. Callers that schedule work due
+almost immediately, under CPU contention, can lose it. Fix before relying on
+near-zero delays.

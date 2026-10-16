@@ -1,148 +1,120 @@
 # AGENTS.md
 
-Working notes for agents modifying this repository. For the data-structure
-design read `ARCHITECTURE.md`; for usage read `README.md`. This file covers the
-repo layout, how to build and test, the invariants you must not break, and the
-traps that are easy to fall into.
+Working notes for anyone changing this repository. [README.md](README.md) is for
+users; [ARCHITECTURE.md](ARCHITECTURE.md) explains the design. This file covers
+the layout, how to build and test, the invariants a change must keep, and the
+traps.
 
 ## Repo map
 
 ```
-stash.h                       The library. Three templates plus StashContext. Header-only.
-stash_trace.h                 No-op default tracing/coloring hooks (stands in for Xapiand's log.h).
-test/test.cc                  Runnable smoke test: a single-level wheel over a leaf.
-examples/colored_trace/       A runnable trace-header injection example (trace.h + main.cc).
-CMakeLists.txt                INTERFACE library target `stash` + CTest test `stash`.
-LICENSE                       MIT, Copyright (c) 2015-2019 Dubalu LLC.
-README.md                     What it is, install, usage, API reference, caveats.
-ARCHITECTURE.md               Internal design, concurrency model, trade-offs.
+stash.h                  The library: Stash, StashSlots, StashValues, StashContext. Header-only.
+stash_trace.h            No-op default tracing and color hooks.
+test/test.cc             Smoke and regression tests (CTest: stash).
+test/concurrent.cc       Many producers and one walking, cleaning consumer: every task fires once.
+test/longevity.cc        Wheel memory over many wraparounds: bounded with clean, growing without.
+examples/demo.cc         A tour of the structure (target stash_demo).
+examples/colored_trace/  Injecting a trace header for colored tracing.
+bench/                   Benchmarks against a locked heap, Asio timers, and a lock-free queue.
+docs/API.md              The API reference.
+docs/stash.d2            The README diagram's source; docs/stash.svg is rendered from it.
+STRAND_FIX.md            The record of the sentinel-frontier change.
 ```
 
-Everything ships in `stash.h`. There is no `.cc` to compile except the test.
-
-## Build and run the test
-
-```sh
-c++ -std=c++17 -I. test/test.cc -o test/test && ./test/test
-```
-
-Expected output: `stash OK: walked 3 values in key order: 11 22 33`, exit 0.
-
-Or via CMake/CTest:
+## Build and test
 
 ```sh
 cmake -B build && cmake --build build && ctest --test-dir build
 ```
 
-The CMake `stash` target is an `INTERFACE` library (`CMakeLists.txt:4`) that
-only adds the include directory and requests `cxx_std_17`. The test target is
-`stash_test`; the registered CTest test name is `stash`.
+The `stash` target (alias `stash::stash`) is an `INTERFACE` library requesting
+`cxx_std_17`. CTest runs `stash_test`, which prints
+`stash OK: walked 3 values in key order: 11 22 33`.
+
+`test/concurrent.cc` and `test/longevity.cc` are not in CTest; build them by
+hand, under ASan or TSan for the concurrent one:
+
+```sh
+c++ -std=c++17 -O1 -g -pthread -fsanitize=thread -I. test/concurrent.cc -o concurrent && ./concurrent
+c++ -std=c++17 -O2 -pthread -I. test/longevity.cc -o longevity && ./longevity
+```
+
+To redraw the README diagram:
+`d2 --layout elk --sketch --theme 302 docs/stash.d2 docs/stash.svg`.
 
 ## Conventions
 
-- **C++17**, header-only. Keep it that way. Anything that would force a `.cc`
-  translation unit or a link step does not belong here.
-- **Lock-free atomics.** All shared mutation goes through `std::atomic` with
-  `compare_exchange` / `exchange` / fetch-add. Do not introduce mutexes,
-  condition variables, or any blocking primitive.
-- **No external dependencies.** The only includes are `<array>`, `<atomic>`,
-  `<cassert>`, and the trace header (`stash.h:34`), which defaults to the local
-  `stash_trace.h`. Do not add new third-party or Xapiand headers, and do not pull
-  a logging or color header into `stash.h` directly — that is what the hooks are
-  for.
-- **Tracing flows through four injectable hooks**, all no-ops by default:
-  `L_STASH`, `L_DEBUG_HOOK` (label-first), `L_EXC`, and the color hook
-  `STASH_OP_COLOR(op)`. The defaults live in `stash_trace.h`, each
-  `#ifndef`-guarded so a consumer can override any subset. `stash.h` reaches them
-  through `#ifdef STASH_TRACE_HEADER` (`stash.h:34`): a consumer injects its own
-  header via `-DSTASH_TRACE_HEADER='"my_trace.h"'`, or defines the macros before
-  including `stash.h`. Keep new trace calls behind these macros; never assume they
-  do anything. `STASH_OP_COLOR` must return a pointer (a string literal or a
-  function-local static will do) that stays valid for the duration of the trace
-  call. Color tokens like `CYAN`/`CLEAR_COLOR` live only inside the no-op macro
-  arguments, so they need not exist in the default build — do not reference them
-  outside a trace call.
+- **C++17, header-only.** Nothing that needs a `.cc` or a link step.
+- **Lock-free atomics.** Shared mutation goes through `std::atomic` with
+  `compare_exchange`, `exchange`, or fetch-add. No mutexes or blocking.
+- **No dependencies.** `stash.h` includes only standard headers and the trace
+  header.
+- **Tracing goes through four hooks**, no-ops by default: `L_STASH`,
+  `L_DEBUG_HOOK` (label first), `L_EXC`, and `STASH_OP_COLOR(op)`. Each default
+  in `stash_trace.h` is `#ifndef`-guarded. A consumer injects its own with
+  `-DSTASH_TRACE_HEADER='"my_trace.h"'` or defines the macros first. Color tokens
+  such as `CYAN` appear only inside trace-macro arguments, so they need not exist
+  in the default build; never reference them outside a trace call.
 - Double quotes in code; no em dashes in prose.
 
 ## Load-bearing invariants
 
-These are the rules the structure's correctness rests on. Breaking one tends to
-produce silent data loss or a race, not a compile error.
+Breaking one of these produces silent loss or a race, not a compile error.
 
-- **Slot/key math.** A `StashSlots` key maps to slot `(key / _Div) % _Mod`
-  (`stash.h:240`), and the per-level key boundaries (`get_base_key`,
-  `get_inc_base_key`, `get_end_base_key`) are all derived from `_Div`/`_Mod`
-  (`stash.h:224`). The walk relies on these to set child `limit_key`s and to
-  advance `atom_first_valid_key`. Change the formula and the wheel mis-buckets
-  or the walk skips live keys.
-- **Publish via CAS.** Every structural install — a `Data` node (`stash.h:171`),
-  a chunk (`stash.h:187`), a child level (`stash.h:344`), a leaf value
-  (`stash.h:474`) — follows allocate, `compare_exchange_strong`, and on a lost
-  race `delete` the loser's allocation and adopt the winner. Never store a raw
-  pointer without the CAS, and never leak the loser.
-- **Single-consumer walk.** `walk_cur` and `clean_cur` are non-atomic
-  (`stash.h:375`); `ctx.begin_key`/`end_key` are plain fields. Exactly one
-  thread may walk/peep/clean a given structure at a time. Producers
-  (`add`/`put`) may run concurrently with each other and with the single walker.
-- **Walk reads with `spawn == false`.** The walk must never allocate. Every
-  read-side `Stash_T::get` passes `false` (`stash.h:263`, `stash.h:403`) and
-  branches on `StashState`. Passing `true` on the walk path would have the
-  consumer racing producers into allocation.
-- **Pointer-like, non-zero values.** The walk's liveness test is `*ptr && **ptr`
-  (`stash.h:437`). Values must be bool-testable and dereferenceable, and a
-  zero/empty value reads as absent.
-- **Key-window bounds.** `add` widens `atom_first_valid_key`/`atom_last_valid_key`
-  (`stash.h:362`); the walk advances `atom_first_valid_key` (`stash.h:319`).
-  `check` (`stash.h:76`) gates the loop on `end_key`, `limit_key`, and
-  `atom_last_valid_key`. Keep these in sync or the walk either stops early or
-  scans dead ranges.
+- **Slot and key math.** A `StashSlots` key maps to slot `(key / _Div) % _Mod`
+  (`get_slot`), and `get_base_key`, `get_inc_base_key`, `get_dec_base_key`, and
+  `get_end_base_key` derive from `_Div` and `_Mod`. The walk uses them to set
+  child `limit_key`s and to advance `atom_first_valid_key`.
+- **Publish via CAS.** Every structural install (a `Data` node, a chunk, a child
+  level, a leaf value) allocates, `compare_exchange_strong`s, and on a lost race
+  deletes its own allocation and adopts the winner's.
+- **One consumer.** `walk`, `peep`, and `clean` run on one thread, one at a time:
+  `walk_cur`, `clean_cur`, and `ctx.begin_key`/`end_key` are plain fields.
+  Producers may run concurrently with each other and with that consumer.
+- **The walk never allocates.** Every read-side `Stash_T::get` passes
+  `spawn == false` and branches on `StashState`.
+- **The sentinel frontier.** A leaf chunk is filled with `stash_reserved<T>()`
+  before it is published, and a reserved slot keeps the sentinel until its value
+  lands. The walk parks on the first sentinel and never steps past it.
+- **`first_valid` is the reclamation boundary.** The walk caps its advance at
+  `pending_floor` (the lowest pending leaf seen this walk); a late insert lowers
+  `first_valid` before its value is published; `clean` frees only subtrees
+  entirely below it. The consumer resets `pending_floor` to `IDLE` at the start
+  of each walk.
+- **Pointer-like, non-null values.** The walk's liveness test is `*ptr && **ptr`;
+  a null or "zero" value reads as absent.
 
 ## How to extend
 
-- **Add a wheel resolution.** Nest another `StashSlots` in the type chain with
-  its own `_Div`/`_Mod`, ensuring each level's span (`_Div * _Mod`) equals the
-  next level's slot width. The leaf stays `StashValues`. See the Xapiand stack
-  in `ARCHITECTURE.md` (`50x1ms -> 10x50ms -> 36x500ms -> 4800x18s`).
+- **Add a resolution.** Nest another `StashSlots` with its own `_Div` and `_Mod`,
+  each level's span (`_Div * _Mod`) equal to the next level's slot width. Xapiand
+  uses `50x1ms -> 10x50ms -> 36x500ms -> 4800x18s`.
 - **Change the value type.** Any pointer-like, bool-testable, dereferenceable
-  type works (`std::shared_ptr<T>` is the reference choice). Verify the walk's
-  `*ptr && **ptr` test means what you intend for the new type.
-- **Plug in tracing (e.g. when debugging).** Inject a trace header with
-  `-DSTASH_TRACE_HEADER='"my_trace.h"'`, or define `L_STASH`, `L_DEBUG_HOOK`,
-  `L_EXC`, `STASH_OP_COLOR`, and the color symbols the trace strings reference
-  before including `stash.h`, instead of letting `stash_trace.h` stub them out.
-  `examples/colored_trace/` is a working reference: build it with
-  `c++ -std=c++20 -I. -I../.. -DSTASH_TRACE_HEADER='"trace.h"' main.cc -o demo`.
-- **Always extend the smoke test.** `test/test.cc` is the only executable check
-  in the repo. Any behavioral change should grow a corresponding assertion
-  there.
+  type works; check what `*ptr && **ptr` means for it.
+- **Grow the tests with the change.** A behavioral change adds an assertion to
+  `test/test.cc`; a change to insert, walk, or `clean` also runs
+  `test/concurrent.cc` under TSan and ASan.
 
 ## Traps
 
-- **Don't store a "zero" value.** It reads as absent and is silently lost. This
-  is the single easiest mistake.
-- **Don't run two walkers.** Nothing stops you at compile time; the non-atomic
-  cursors will corrupt.
-- **Don't drop the loser's allocation handling.** On a lost CAS the speculative
-  `new` must be `delete`d (`stash.h:174`, `stash.h:190`, `stash.h:347`,
-  `stash.h:477`). Omitting it leaks; reusing the loser's pointer is a
-  use-after-free waiting to happen.
-- **Mind the overflow.** `add` throws `std::out_of_range("stash overflow")` when
-  a key is more than one wheel span past `atom_first_valid_key` (`stash.h:356`).
-  The driving scheduler is responsible for draining as the clock advances.
-- **The destructor is manual and not concurrency-safe.** `Data::~Data`
-  (`stash.h:130`) hand-walks and frees the node chain and chunk. Do not destroy
-  a structure while a walker or producer is touching it.
+- **A "zero" value is silently lost.** It reads as absent.
+- **Two consumers corrupt the cursors.** Nothing stops it at compile time.
+- **A lost CAS must delete its allocation.** Omitting it leaks; reusing the
+  loser's pointer is a use-after-free.
+- **`clean` is required.** Without it the structure grows without bound.
+- **Size the span above one clean pass.** A wheel the consumer laps aliases a live
+  subtree while `clean` frees it.
+- **Overflow throws.** `add` throws `std::out_of_range("stash overflow")` past one
+  span (less `horizon_margin`) from `atom_first_valid_key`; the scheduler drains
+  as its clock advances.
+- **Destruction is manual and not concurrent.** `Data::~Data` frees the node
+  chain and chunks by hand; destroy a structure only when no producer or consumer
+  touches it.
 
 ## Standalone vs. Xapiand
 
-This is a standalone extraction of `stash.h` from
-[Xapiand](https://github.com/Kronuz/Xapiand). The delta from the original is that
-the dependency on Xapiand's `log.h` and color palette was replaced by the
-injectable trace hooks: `#include "log.h"` became a conditional include defaulting
-to the no-op `stash_trace.h` (`stash.h:34`), and `_col()` resolves through
-`STASH_OP_COLOR` (`stash.h:117`). The data-structure logic is otherwise identical,
-and the colored tracing is fully recoverable by injecting a trace header (see
-`examples/colored_trace/`). Keep changes that are pure extraction hygiene clearly
-separated from changes to the algorithm so they can be reconciled with upstream.
-For the scheduler design this powers, see
-[Xapiand's SCHEDULER.md](https://github.com/Kronuz/Xapiand/blob/master/SCHEDULER.md).
+This is `stash.h` extracted from [Xapiand](https://github.com/Kronuz/Xapiand),
+with Xapiand's `log.h` and color palette replaced by the injectable trace hooks.
+Since the extraction it gained the sentinel frontier and walk-based `clean`
+([STRAND_FIX.md](STRAND_FIX.md)). Keep extraction hygiene separate from algorithm
+changes so the two can be reconciled with Xapiand.

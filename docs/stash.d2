@@ -1,0 +1,30 @@
+# stash: many producers insert lock-free; one consumer drains in key order.
+# Render: d2 --layout elk --sketch --theme 302 docs/stash.d2 docs/stash.svg
+direction: right
+
+producers: Producers {
+  shape: rectangle
+  style.multiple: true
+  label: "producers\nadd(ctx, key, value)"
+}
+
+wheel: StashSlots levels {
+  l1: "18 s × 4800"
+  l2: "500 ms × 36"
+  l3: "50 ms × 10"
+  l4: "1 ms × 50"
+  l1 -> l2 -> l3 -> l4: "key / Div % Mod"
+}
+
+leaf: StashValues leaf {
+  shape: queue
+  label: "StashValues\nappend-only leaf"
+}
+
+consumer: Consumer {
+  label: "one consumer\nwalk · peep · clean"
+}
+
+producers -> wheel.l1: "lock-free CAS"
+wheel.l4 -> leaf
+consumer -> wheel.l1: "drains in key order" {style.stroke-dash: 3}

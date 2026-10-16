@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
 	std::atomic<uint64_t> uid_gen{0};
 	std::atomic<uint64_t> added_count{0}, added_xor{0};
 	uint64_t fired_count = 0, fired_xor = 0;     // consumer-only
+	unsigned long long drain_ns = 0;               // how long the final drain took
 	std::atomic<int> phase{0};                   // 0=run, 1=draining
 	std::atomic<bool> producers_done{false};
 #ifdef TRACK_MEM
@@ -201,18 +202,22 @@ int main(int argc, char** argv) {
 			while (lb > pk && !peak_live.compare_exchange_weak(pk, lb)) {}
 #endif
 		}
-		// Producers told to stop; wait until they're joined, then drain for a
-		// bounded wall-clock window long enough that every scheduled task is due.
-		// Bounded so a lost/stuck task reports as a loss instead of hanging.
+		// Producers told to stop; wait until they're joined, then drain until every
+		// added task has fired. A starved consumer may be far behind, so a fixed window
+		// would count late tasks as lost; the 10 s cap still turns a lost task into a
+		// failure instead of a hang.
 		while (!producers_done.load(std::memory_order_acquire)) {}
-		auto drain_until = now_ns() + 3ULL * HORIZON + margin;
-		while (now_ns() < drain_until) {
+		auto drain_start = now_ns();
+		auto drain_floor = drain_start + 3ULL * HORIZON + margin + lead;
+		auto drain_cap = drain_start + 10000ULL * MS;
+		while (now_ns() < drain_floor || (fired_count < added_count.load() && now_ns() < drain_cap)) {
 			ctx.op = StashContext::Operation::walk;
 			ctx.pending_floor = StashContext::IDLE;   // Step 3: fresh per walk
 			ctx.begin_key = ctx.atom_first_valid_key.load();
 			ctx.end_key = now_ns();
 			while (wheel->next(ctx, &out)) { if (out) fire(out); out.reset(); }
 		}
+		drain_ns = now_ns() - drain_start;
 	};
 
 	std::thread cons(consumer);
@@ -227,7 +232,7 @@ int main(int argc, char** argv) {
 
 	uint64_t added = added_count.load(), axor = added_xor.load();
 	bool ok = (fired_count == added) && (fired_xor == axor);
-	printf("producers=%d  seconds=%.1f  margin=%llums\n", nproducers, seconds, margin / MS);
+	printf("producers=%d  seconds=%.1f  margin=%llums  lead=%llums  final drain=%llums\n", nproducers, seconds, margin / MS, lead / MS, drain_ns / MS);
 	printf("  added=%llu fired=%llu  xor(add)=%016llx xor(fire)=%016llx\n",
 	       (unsigned long long)added, (unsigned long long)fired_count,
 	       (unsigned long long)axor, (unsigned long long)fired_xor);

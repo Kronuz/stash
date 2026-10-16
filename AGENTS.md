@@ -124,7 +124,7 @@ changes so the two can be reconciled with Xapiand.
 
 A task that comes due while its own insert is still descending can be skipped by the
 walk. `concurrent.cc` reproduces it with no lead: pinned to two cores on Linux
-(`taskset -c 0,1 stash_concurrent 4 2.0 32 0 0`), five of five runs lost 206 to 347
-of about 300,000 tasks; with a 20 ms lead, none. Callers that schedule work due
+(`taskset -c 0,1 stash_concurrent 4 2.0 32 0 0`), every run lost 200 to 350 of about
+300,000 tasks, and a 10 s final drain does not recover them; with a 20 ms lead, none. Callers that schedule work due
 almost immediately, under CPU contention, can lose it. Fix before relying on
 near-zero delays.

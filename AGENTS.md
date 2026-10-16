@@ -31,11 +31,12 @@ The `stash` target (alias `stash::stash`) is an `INTERFACE` library requesting
 `cxx_std_17`. CTest runs `stash_test`, which prints
 `stash OK: walked 3 values in key order: 11 22 33`.
 
-`test/concurrent.cc` and `test/longevity.cc` are not in CTest; build them by
-hand, under ASan or TSan for the concurrent one:
+`test/concurrent.cc` runs in CTest as `stash_concurrent` (4 producers, 2 s), so the
+CI sanitizer jobs cover reclamation; run it longer by hand with
+`build/stash_concurrent PRODUCERS SECONDS`. `test/longevity.cc` is a manual tool (it
+replaces global `new`, so not under ASan, and always exits 0):
 
 ```sh
-c++ -std=c++17 -O1 -g -pthread -fsanitize=thread -I. test/concurrent.cc -o concurrent && ./concurrent
 c++ -std=c++17 -O2 -pthread -I. test/longevity.cc -o longevity && ./longevity
 ```
 

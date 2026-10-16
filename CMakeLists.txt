@@ -13,6 +13,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(stash_test test/test.cc)
   target_link_libraries(stash_test PRIVATE stash)
   add_test(NAME stash COMMAND stash_test)
+  # Producers racing the walking cleaner for 2 s; exits nonzero on a lost or
+  # double-fired task, so the sanitizer jobs check reclamation too.
+  find_package(Threads REQUIRED)
+  add_executable(stash_concurrent test/concurrent.cc)
+  target_link_libraries(stash_concurrent PRIVATE stash Threads::Threads)
+  add_test(NAME stash_concurrent COMMAND stash_concurrent 4 2.0)
+  set_tests_properties(stash_concurrent PROPERTIES TIMEOUT 60)
 
   # A runnable tour of the data structure (not a test): build & run
   # ./build/stash_demo. Header-only like the test, so it just links the

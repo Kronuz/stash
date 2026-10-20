@@ -20,11 +20,10 @@
 // clean reclaims up to the walk's live low-water mark (first_valid), no wall-clock
 // margin. first_valid is a safe boundary: a leaf with an in-flight insert pins it
 // (a chunk is sentinel-initialized before it is published, so the walk parks on
-// the reserved slot instead of passing an empty hole), and a late insert lowers
-// it. The residual is the descent window -- a task going due *during* its own
-// insert, only when insert latency exceeds the task's lead -- which costs at most
-// a rare lost task at the extreme leading edge and vanishes once lead > insert
-// latency. The `margin` arg pads the final drain window.
+// the reserved slot instead of passing an empty hole), and an insert still
+// descending pins it through its announce, so a task going due during its own
+// insert is neither skipped nor freed under the producer. Run it with no lead
+// (the default) to exercise that window. The `margin` arg pads the final drain.
 //
 // A fatal signal self-reports "RESULT: FAIL (fatal signal)" so any runner counts
 // a crash as a failure: a SIGBUS/SIGSEGV that printed nothing used to read as a
@@ -116,11 +115,8 @@ int main(int argc, char** argv) {
 	double seconds = argc > 2 ? atof(argv[2]) : 2.0;
 	unsigned long long margin = (argc > 3 ? (unsigned long long)atoll(argv[3]) : 32) * MS;
 	unsigned long long pause_ns = argc > 4 ? (unsigned long long)atoll(argv[4]) : 0;  // throttle per add
-	// Base lead added to every key (ms). 0 = leading edge (the hardest case for
-	// plain/ASan accounting). Under TSan, whose ~20x slowdown inflates insert
-	// latency past an 8ms lead, set this above that latency (e.g. 16) so the run
-	// tests races/UAF without the descent-window artifact (a task going due mid-
-	// insert), which only exists when lead < insert latency -- never in practice.
+	// Base lead added to every key (ms). 0 = leading edge: tasks come due while
+	// their own insert is still descending, the hardest case for the accounting.
 	unsigned long long lead = (argc > 5 ? (unsigned long long)atoll(argv[5]) : 0) * MS;
 
 	// Unbuffered output (so nothing is lost on a crash) + a watchdog that turns an
@@ -178,7 +174,7 @@ int main(int argc, char** argv) {
 		TaskPtr out;
 		while (phase.load(std::memory_order_acquire) == 0) {
 			ctx.op = StashContext::Operation::walk;
-			ctx.pending_floor = StashContext::IDLE;   // Step 3: fresh per walk
+			ctx.pending_floor = StashContext::IDLE;   // fresh per walk
 			ctx.begin_key = ctx.atom_first_valid_key.load();
 			ctx.end_key = now_ns();
 			while (wheel->next(ctx, &out)) { if (out) fire(out); out.reset(); }
@@ -190,8 +186,8 @@ int main(int argc, char** argv) {
 			cctx.begin_key = cctx.atom_first_valid_key.load();
 			// Walk-based clean ("clean as walking"): reclaim up to the walk's live
 			// low-water mark, with no wall-clock margin. first_valid is a safe
-			// boundary -- pending leaves pin it (Step 3) and late inserts lower it --
-			// so everything strictly below it has been walked and drained. This is
+			// boundary -- pending leaves and in-flight inserts pin it -- so
+			// everything strictly below it has been walked and drained. This is
 			// what replaced the now-margin cutoff; `margin` now only pads the final
 			// drain window below.
 			cctx.end_key = ctx.atom_first_valid_key.load();
@@ -212,7 +208,7 @@ int main(int argc, char** argv) {
 		auto drain_cap = drain_start + 10000ULL * MS;
 		while (now_ns() < drain_floor || (fired_count < added_count.load() && now_ns() < drain_cap)) {
 			ctx.op = StashContext::Operation::walk;
-			ctx.pending_floor = StashContext::IDLE;   // Step 3: fresh per walk
+			ctx.pending_floor = StashContext::IDLE;   // fresh per walk
 			ctx.begin_key = ctx.atom_first_valid_key.load();
 			ctx.end_key = now_ns();
 			while (wheel->next(ctx, &out)) { if (out) fire(out); out.reset(); }

@@ -188,10 +188,87 @@ static void test_high_key_span_guard() {
 	std::printf("stash OK: high-key span guard rejects beyond-horizon without wrapping\n");
 }
 
+// Descent-window regressions. An insert is in flight from its announce until
+// its value is in place; the walk must not advance first_valid past it (else it
+// skips the task and clean frees the leaf under the producer), and an insert
+// keyed below the floor of a walk that already ran must still fire.
+static void drain(Wheel& wheel, StashContext& ctx, unsigned long long end, std::vector<int>& got) {
+	Item item;
+	ctx.op = StashContext::Operation::walk;
+	for (int guard = 0; guard < 100; ++guard) {
+		ctx.pending_floor = StashContext::IDLE;
+		ctx.begin_key = ctx.atom_first_valid_key.load();
+		ctx.end_key = end;
+		item.reset();
+		if (!wheel.next(ctx, &item)) break;
+		if (item) got.push_back(*item);
+	}
+}
+
+static void test_descent_window() {
+	// An announced insert at key 3 holds first_valid at or below 3 through a walk
+	// to 8, though nothing is stored at 3 yet; once it lands, the next walk fires it.
+	{
+		Wheel wheel;
+		StashContext ctx(0ULL);
+		std::vector<int> got;
+		{
+			StashContext::InFlight in_flight(ctx, 3);
+			assert(in_flight.key() == 3);
+			drain(wheel, ctx, 8, got);
+			assert(got.empty());
+			assert(ctx.atom_first_valid_key.load() <= 3 && "walk passed an in-flight insert");
+			wheel.put(ctx, in_flight.key(), std::make_shared<int>(33));
+		}
+		drain(wheel, ctx, 8, got);
+		assert(got.size() == 1 && got[0] == 33);
+	}
+
+	// A key below the floor of a walk that already ran is filed at the floor, so
+	// a later walk with the same end fires it; nothing is left behind.
+	{
+		Wheel wheel;
+		StashContext ctx(0ULL);
+		std::vector<int> got;
+		wheel.add(ctx, 1, std::make_shared<int>(11));
+		drain(wheel, ctx, 8, got);
+		assert(got.size() == 1 && got[0] == 11);
+		wheel.add(ctx, 2, std::make_shared<int>(22));   // 2 < floor (7)
+		drain(wheel, ctx, 8, got);
+		assert(got.size() == 2 && got[1] == 22 && "late insert below the floor was lost");
+		assert(ctx.atom_first_valid_key.load() <= ctx.atom_insert_floor.load());
+	}
+
+	// More inserts in flight than announce slots: the overflow holds first_valid
+	// where it stands until they finish, then the walk advances again.
+	{
+		Wheel wheel;
+		StashContext ctx(0ULL);
+		std::vector<int> got;
+		std::vector<std::unique_ptr<StashContext::InFlight>> slots;
+		for (size_t i = 0; i < StashContext::ANNOUNCE_SLOTS; ++i) {
+			slots.push_back(std::make_unique<StashContext::InFlight>(ctx, 6));
+		}
+		{
+			StashContext::InFlight overflowed(ctx, 3);
+			assert(ctx.atom_announce_overflow.load() == 1);
+			drain(wheel, ctx, 8, got);
+			assert(ctx.atom_first_valid_key.load() == 0 && "walk passed an overflowed insert");
+		}
+		slots.clear();
+		drain(wheel, ctx, 8, got);
+		assert(ctx.atom_first_valid_key.load() > 3 && "first_valid stuck after the overflow drained");
+		assert(got.empty());
+	}
+
+	std::printf("stash OK: in-flight inserts pin first_valid; late inserts still fire\n");
+}
+
 int main() {
 	test_smoke();
 	test_low_key_no_underflow();
 	test_high_key_span_guard();
+	test_descent_window();
 	std::printf("all stash tests passed\n");
 	return 0;
 }

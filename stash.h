@@ -29,6 +29,7 @@
 #include <limits>                // for std::numeric_limits
 #include <memory>                // for std::unique_ptr / std::make_unique
 #include <stdexcept>             // for std::out_of_range
+#include <type_traits>           // for std::void_t
 
 // Tracing and coloring are optional and fully injectable. Define
 // STASH_TRACE_HEADER (a header path) before including this file to plug in your
@@ -66,6 +67,15 @@ inline T* stash_reserved() noexcept {
 }
 
 
+// Each thread's preferred announce slot; it moves to wherever the thread last
+// found a free one.
+inline unsigned& stash_announce_hint() noexcept {
+	static std::atomic<unsigned> seq{0};
+	static thread_local unsigned hint = seq.fetch_add(1, std::memory_order_relaxed);
+	return hint;
+}
+
+
 struct StashContext {
 	enum class Operation : uint8_t {
 		walk,
@@ -73,8 +83,12 @@ struct StashContext {
 		clean,
 	};
 
-	// Sentinel for pending_floor: "no in-flight insert seen this walk".
+	// Sentinel for pending_floor and idle announce slots.
 	static constexpr unsigned long long IDLE = std::numeric_limits<unsigned long long>::max();
+
+	// Announce slots: more producers in flight at once than this share one
+	// overflow counter, which holds first_valid still until they finish.
+	static constexpr size_t ANNOUNCE_SLOTS = 64;
 
 	Operation op;
 
@@ -99,6 +113,23 @@ struct StashContext {
 	// leaf, during that walk.
 	unsigned long long pending_floor = IDLE;
 
+	// The descent-window handshake (ARCHITECTURE.md, "Inserts in flight").
+	// add() announces its key in a slot before it touches the tree and files a
+	// key below atom_insert_floor at that floor; the walk publishes the floor,
+	// then reads the slots, and never raises first_valid above what it read.
+	struct alignas(64) Announce {
+		std::atomic_ullong key{IDLE};
+	};
+	std::array<Announce, ANNOUNCE_SLOTS> announce;
+	alignas(64) std::atomic_ullong atom_announce_overflow{0};
+	alignas(64) std::atomic_ullong atom_insert_floor;
+
+	// Consumer-only: the floor last published, the first_valid ceiling read with
+	// it, and the walk's recursion depth (the floor is refreshed at depth 0).
+	unsigned long long insert_floor;
+	unsigned long long first_valid_cap;
+	unsigned depth = 0;
+
 	StashContext(StashContext&& o) noexcept
 		: op(std::move(o.op)),
 		  begin_key(std::move(o.begin_key)),
@@ -106,14 +137,109 @@ struct StashContext {
 		  atom_first_valid_key(o.atom_first_valid_key.load()),
 		  atom_last_valid_key(o.atom_last_valid_key.load()),
 		  horizon_margin(o.horizon_margin),
-		  pending_floor(o.pending_floor) { }
+		  pending_floor(o.pending_floor),
+		  atom_insert_floor(o.atom_insert_floor.load()),
+		  insert_floor(o.insert_floor),
+		  first_valid_cap(o.first_valid_cap) { }
 
 	explicit StashContext(unsigned long long begin_key)
 		: op(Operation::walk),
 		  begin_key(begin_key),
 		  end_key(begin_key),
 		  atom_first_valid_key(begin_key),
-		  atom_last_valid_key(begin_key) { }
+		  atom_last_valid_key(begin_key),
+		  atom_insert_floor(begin_key),
+		  insert_floor(begin_key),
+		  first_valid_cap(begin_key) { }
+
+	// Producer side: an insert in flight. Announces before the descent and yields
+	// the key to file under (never below the insert floor); the destructor
+	// retracts the announce once the value is in place.
+	class InFlight {
+		std::atomic_ullong* slot = nullptr;
+		std::atomic_ullong* overflow = nullptr;
+		unsigned long long key_;
+
+	public:
+		InFlight(StashContext& ctx, unsigned long long key) {
+			// Announce at most the key it will file under, so the walk may advance
+			// to the current floor even while a late insert is in flight.
+			auto floor = ctx.atom_insert_floor.load(std::memory_order_relaxed);
+			auto announced = key < floor ? floor : key;
+			auto& hint = stash_announce_hint();
+			for (size_t i = 0; i < ANNOUNCE_SLOTS; ++i) {
+				auto idx = (hint + i) % ANNOUNCE_SLOTS;
+				auto& a = ctx.announce[idx].key;
+				auto idle = IDLE;
+				// seq_cst: pairs with the walk's seq_cst floor store and slot loads
+				// (a store-load handshake, so acq/rel is not enough).
+				if (a.load(std::memory_order_relaxed) == IDLE &&
+				    a.compare_exchange_strong(idle, announced,
+				        std::memory_order_seq_cst, std::memory_order_relaxed)) {
+					slot = &a;
+					hint = static_cast<unsigned>(idx);
+					break;
+				}
+			}
+			if (!slot) {
+				overflow = &ctx.atom_announce_overflow;
+				overflow->fetch_add(1, std::memory_order_seq_cst);
+			}
+			// Either the walk saw the announce, or this load sees its floor.
+			floor = ctx.atom_insert_floor.load(std::memory_order_seq_cst);
+			key_ = key < floor ? floor : key;
+		}
+
+		~InFlight() {
+			// release: a walk that reads the slot idle sees the filled value.
+			if (slot) {
+				slot->store(IDLE, std::memory_order_release);
+			} else {
+				overflow->fetch_sub(1, std::memory_order_release);
+			}
+		}
+
+		InFlight(const InFlight&) = delete;
+		InFlight& operator=(const InFlight&) = delete;
+
+		unsigned long long key() const noexcept {
+			return key_;
+		}
+	};
+
+	// Consumer side, at the start of a walk: publish the insert floor (end_key - 1)
+	// once it has moved a finest slot, then read the announces. Until the next
+	// refresh the walk keeps first_valid at or below the lowest announce, the
+	// floor, and (with overflowed producers in flight) where it stands now.
+	void refresh_first_valid_cap(unsigned long long period) {
+		if (op != Operation::walk || !end_key) {
+			return;
+		}
+		auto floor = end_key - 1;
+		bool advanced = floor > insert_floor && floor - insert_floor >= period;
+		bool pinned = first_valid_cap < insert_floor;
+		if (!advanced && !pinned) {
+			return;
+		}
+		if (floor > insert_floor) {
+			insert_floor = floor;
+			atom_insert_floor.store(floor, std::memory_order_seq_cst);
+		}
+		auto cap = insert_floor;
+		for (auto& a : announce) {
+			auto k = a.key.load(std::memory_order_seq_cst);
+			if (k < cap) {
+				cap = k;
+			}
+		}
+		if (atom_announce_overflow.load(std::memory_order_seq_cst)) {
+			auto f = atom_first_valid_key.load(std::memory_order_relaxed);
+			if (f < cap) {
+				cap = f;
+			}
+		}
+		first_valid_cap = cap;
+	}
 
 	bool check(unsigned long long key, unsigned long long limit_key) const {
 		if (end_key && key >= end_key) {
@@ -314,9 +440,24 @@ protected:
 };
 
 
+// The finest slot width under a level: its own _Div over a leaf, else its child's.
+template <typename T, typename = void>
+struct stash_finest_div : std::integral_constant<unsigned long long, 0> { };
+
+template <typename T>
+struct stash_finest_div<T, std::void_t<decltype(T::finest_div)>>
+	: std::integral_constant<unsigned long long, T::finest_div> { };
+
+
 template <typename _Tp, size_t _Size, unsigned long long _Div, unsigned long long _Mod>
 class StashSlots : public Stash<_Tp, _Size> {
 	using Stash_T = Stash<_Tp, _Size>;
+
+public:
+	static constexpr unsigned long long finest_div =
+		stash_finest_div<_Tp>::value ? stash_finest_div<_Tp>::value : _Div;
+
+private:
 
 	unsigned long long get_base_key(unsigned long long key) const {
 		return (key / _Div) * _Div;
@@ -368,6 +509,17 @@ public:
 	template <typename T>
 	bool next(StashContext& ctx, T* value_ptr, unsigned long long limit_key) {
 		bool found = false;
+
+		// The outermost level refreshes the walk's first_valid ceiling before
+		// reading anything, so the ceiling predates every load this walk makes.
+		struct Depth {
+			unsigned& d;
+			explicit Depth(unsigned& d) : d(d) { ++d; }
+			~Depth() { --d; }
+		} depth(ctx.depth);
+		if (ctx.depth == 1) {
+			ctx.refresh_first_valid_cap(finest_div);
+		}
 
 		auto loop = ctx.check(ctx.begin_key, limit_key);
 
@@ -457,6 +609,10 @@ public:
 					new_first_valid_key = pending_base;
 				}
 			}
+			// Nor past an insert that may still be descending (see InFlight).
+			if (ctx.op == StashContext::Operation::walk && ctx.first_valid_cap < new_first_valid_key) {
+				new_first_valid_key = ctx.first_valid_cap;
+			}
 			// release on success publishes the advanced low-water mark; the loop's
 			// reload only needs the latest value, so relaxed there.
 			auto first_valid_key = ctx.atom_first_valid_key.load(std::memory_order_relaxed);
@@ -498,6 +654,11 @@ public:
 
 	template<typename... Args>
 	void add(StashContext& ctx, unsigned long long key, Args&&... args) {
+		// Announce before touching the tree; a key already below the insert floor
+		// (overdue past the last walk's end) is filed at the floor instead.
+		StashContext::InFlight in_flight(ctx, key);
+		key = in_flight.key();
+
 		// R2: the schedulable horizon, minus an optional keep-out zone. Rejecting
 		// keys within horizon_margin of the end stops a near-horizon insert from
 		// aliasing onto a slot being reclaimed one wheel period below.
@@ -509,9 +670,6 @@ public:
 			throw std::out_of_range("stash overlow");
 		}
 
-		// Step 2: the valid-key bound is now published inside the leaf's put(),
-		// between RESERVE and FILL, so it covers `key` while the slot is still a
-		// hole. It used to be widened here, after the whole descent+fill returned.
 		L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load());
 		put(ctx, key, std::forward<Args>(args)...);
 	}
@@ -670,20 +828,11 @@ public:
 		Stash_T::get(&ptr_atom_ptr, slot, true);
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
-		// `key`. Doing this *before* the fill is the crux of Step 2 -- it lets the
-		// walk descend to this leaf while the slot is still a reserved hole and
-		// observe it as pending (walk_cur parks on the sentinel, walk_cur < atom_end),
-		// so the wheel pins first_valid to it. Publishing after the fill (where these
-		// two CAS loops used to live, at the end of StashSlots::add) would hide the
-		// pending state and let the consumer's low-water mark run past an in-flight
-		// insert.
-		// release on success: the bound is the leaf's publication point. Acquiring
-		// it (check(), ret_next, the R2 horizon) orders the reader after the path
-		// built during descent and after this slot's reserve.
-		auto first_valid_key = ctx.atom_first_valid_key.load(std::memory_order_relaxed);
-		while (key < first_valid_key &&
-		       !ctx.atom_first_valid_key.compare_exchange_weak(first_valid_key, key,
-		           std::memory_order_release, std::memory_order_relaxed));
+		// `key`, so a walk can descend to this leaf while the slot is still a
+		// reserved hole and see it pending. first_valid is the walk's alone:
+		// add() files keys at or above the insert floor, which first_valid never
+		// passes. release on success: acquiring the bound (check()) orders the
+		// reader after the path built during descent and after this reserve.
 		auto last_valid_key = ctx.atom_last_valid_key.load(std::memory_order_relaxed);
 		while (key > last_valid_key &&
 		       !ctx.atom_last_valid_key.compare_exchange_weak(last_valid_key, key,

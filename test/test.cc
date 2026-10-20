@@ -239,6 +239,29 @@ static void test_descent_window() {
 		assert(ctx.atom_first_valid_key.load() <= ctx.atom_insert_floor.load());
 	}
 
+	// A walk of several next() calls that continues from begin_key (concurrent.cc's
+	// style): the snapshot taken where the walk starts must bound every call. Call
+	// 1 sees an announce at 3 and returns 55; the producer then lands 3 and
+	// retracts before call 2 continues from 5. The next walk must still fire 33.
+	{
+		Wheel wheel;
+		StashContext ctx(0ULL);
+		std::vector<int> got;
+		Item item;
+		wheel.add(ctx, 5, std::make_shared<int>(55));
+		auto in_flight = std::make_unique<StashContext::InFlight>(ctx, 3);
+		ctx.op = StashContext::Operation::walk;
+		ctx.pending_floor = StashContext::IDLE;
+		ctx.begin_key = ctx.atom_first_valid_key.load();
+		ctx.end_key = 8;
+		assert(wheel.next(ctx, &item) && *item == 55);
+		wheel.put(ctx, in_flight->key(), std::make_shared<int>(33));
+		in_flight.reset();
+		while (wheel.next(ctx, &item)) {}
+		drain(wheel, ctx, 8, got);
+		assert(got.size() == 1 && got[0] == 33 && "continuation walk stranded a landed insert");
+	}
+
 	// More inserts in flight than announce slots: the overflow holds first_valid
 	// where it stands until they finish, then the walk advances again.
 	{

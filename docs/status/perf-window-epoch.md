@@ -2,24 +2,24 @@
 
 ## State
 
-Prototype built (170e1d8) with the adaptive shrink; model holds, every mutant loses; tests and
-sanitizers clean. Timed A/B against main pending a strict hold.
+Done, ready for review; not merged. Results and verdict in `docs/perf/window-epoch.md`.
 
 ## Done
 
-- Plan (db6a9bc); prototype, tests, bursty far column (170e1d8).
-- Model (`.scratch/model/stash_model.py`, results in `results-window*.txt`): main and the variant
-  hold in both walk styles; the far producer is stalled past the window (the window moved up to 9
-  times past it, the floor up to 4 past its key); mutants without the epoch count, the W recheck,
-  the previous-window hold, the advance gate, the window cap, or with an immediate shrink lose.
-- TSan and ASan+UBSan: test.cc, concurrent.cc at lead 0 and lead 60 (far path), all clean.
+- Plan (db6a9bc); prototype, tests, bursty far column (170e1d8); width initializer (6af4922).
+- Model: main and the variant hold in both walk styles with a far producer stalled past the
+  window; every mutant loses (no epoch count, no W recheck, no previous-window hold, no advance
+  gate, no cap at W, immediate shrink).
+- A/B against main, 5 interleaved rounds, plus an A/A anchor: no regression beyond noise.
+- Overflow at 1,024 bursty threads: main 333 claims in about 103M adds (6 of 15 runs), window 0.
+- Starved stress, 40 runs each at lead 0 and 60: 0 lost on both; always-narrowing build too.
+- TSan, ASan+UBSan clean; CI green on all 8 jobs (run 39381632466, at 5af109a).
 
 ## Next
 
-1. Strict-hold A/B: bench_structures, bench_bursty (+ overflow rounds, window probe), starved
-   stress at lead 0 and 60, 40 runs each.
-2. Results and recommendation in docs/perf/window-epoch.md.
+1. Code review and an architect re-check of the handshake before anything lands.
+2. A timed run on Linux and arm64 (CI covered correctness only).
 
 ## Blocked on
 
-Nothing (waiting for the host's light hold to clear before the strict runs).
+Nothing.

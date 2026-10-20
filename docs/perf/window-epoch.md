@@ -1,6 +1,8 @@
 # Windowed announce board with far-insert epochs
 
-Branch `perf/window-epoch` from main `a41b2d0`. Prototype, not for merging.
+Branch `perf/window-epoch` from main `a41b2d0`. Kept by the owner with a fixed width; for review,
+not merged. The first round below measured the adaptive variant (170e1d8); "Fixed width" at the
+end re-measures what the branch now carries.
 
 ## Target
 
@@ -31,9 +33,10 @@ path is two locked RMWs, the board path one CAS and one plain store).
    (spread and convergent, 1/2/4/8/14 threads, throughput and p99), `bench_bursty` at 256 and
    1,024 threads (adds/s, p50/p99/p999, overflows, far inserts, lost), the starved stress at lead 0
    (40 runs each), TSan and ASan on `test/concurrent.cc` and `test/test.cc`.
-3. Overflow handling (owner's direction, final form): an adaptive shrink, one occupancy check per
+3. Overflow handling (owner's direction, first form): an adaptive shrink, one occupancy check per
    window move (narrow to one chunk at 32 slots taken, widen again at 8 or fewer); no overflow
-   floor and no eviction of board entries.
+   floor and no eviction of board entries. Dropped afterwards (owner): the width is fixed at the
+   wide width, and overflow and holds are reported only through compile-time stats hooks.
 
 ## Keep or remove
 
@@ -177,6 +180,82 @@ to none measured. It meets the owner's bar to land, with two caveats for the rev
 main is a bounded, non-sticky freeze of `first_valid`, so the win is in tail cleanup delay, not in
 correctness or throughput; and the shrink never engaged on these workloads, so it is safe (model,
 always-narrowing stress) but its benefit is unmeasured. Not measured on Linux or arm64 beyond CI.
+
+## Fixed width (owner's decisions, d234d24)
+
+The owner kept the board and dropped the adaptive shrink: the window is always `WINDOW_CHUNK *
+WINDOW_WIDE` finest slots (64 ms on Xapiand's wheel). In the same change, overflow and holds are
+reported only through compile-time hooks (`STASH_HELD_STAT(overflow, far_pin)` beside
+`STASH_ANNOUNCE_STAT` and `STASH_FAR_STAT`), `add` returns false instead of throwing past the
+horizon, and `next` is `noexcept` for nothrow value types. None of these touch the handshake, so
+the expectation was no difference against the first round; this section re-measures.
+
+### Model
+
+`.scratch/model/stash_model.py` minus the width and occupancy state (the adaptive model is kept as
+`stash_model_adaptive.py`); `run_fixed.sh`, results in `results-fixed.txt`.
+
+| Configuration | States | Verdict |
+|---|---|---|
+| fixed, sched / cont, 1 slot, width 2 | 10,094,389 / 10,590,992 | no violation |
+| fixed, 2 slots / period 2 / width 1 / width 3 with leads 1,4 and 6 ticks | 3,289,315 / 3,376,081 / 10,578,023 / 17,164,744 | no violation |
+| without the epoch count (width 3) | 203,049 | FV: first_valid 3 passed key 2 |
+| without the `W` recheck (width 3) | 273,888 | LOSS: key 2 stranded below first_valid 4 |
+| without the previous-window hold (width 3) | 276,232 | FV |
+| without the cap at `W` (width 1) | 999,604 | UAF: reserve in a freed node |
+| without the advance gate (width 1) | 80,486 | FV |
+| main, sched / cont, 2 slots | 798,949 / 831,991 | no violation |
+
+A far producer stays in flight while the window moves up to 9 times past the `W` it read. The
+shrink mutants are gone with the shrink. The model does not cover the horizon, so the bool `add`
+needs no model run: a refused key returns before `put`, exactly where the throw left.
+
+### A/B against main
+
+Same method as above (best of 3 per cell per round, 5 interleaved rounds, median [min-max]), under
+one strict `quiet run` hold; another agent's light single-thread hold was live throughout. Both
+builds compile the identical harness, a snapshot in `.scratch/probes/ab-src/` (its `try`/`catch`
+around `add` compiles against either API). Logs: `.scratch/logs/ab-fixed.log`, summary
+`ab-fixed-summary.md`.
+
+| Keys | Threads | main Mops | fix Mops | Δ | main p99 ns | fix p99 ns | Δ p99 |
+|---|---|---|---|---|---|---|---|
+| spread | 1 | 1.02 [0.95-1.06] | 1.00 [0.93-1.08] | -2.1% | 1636 [1583-1930] | 1729 [1503-2020] | +5.7% |
+| spread | 2 | 1.42 [1.39-1.48] | 1.41 [1.34-1.50] | -0.8% | 2277 [2168-2327] | 2318 [2115-2403] | +1.8% |
+| spread | 4 | 1.99 [1.97-2.06] | 1.97 [1.91-2.07] | -1.4% | 3262 [3070-3299] | 3348 [3186-3560] | +2.6% |
+| spread | 8 | 2.59 [2.48-2.78] | 2.65 [2.46-2.84] | +2.4% | 4590 [4404-4617] | 4528 [4396-4762] | -1.4% |
+| spread | 14 | 3.73 [3.45-3.98] | 3.61 [3.35-3.93] | -3.2% | 6565 [6130-6891] | 6491 [6422-7006] | -1.1% |
+| convergent | 1 | 1.88 [1.84-2.01] | 1.90 [1.86-1.99] | +1.4% | 780 [686-795] | 771 [703-797] | -1.2% |
+| convergent | 2 | 2.29 [2.29-2.39] | 2.31 [2.26-2.37] | +0.7% | 1464 [1436-1539] | 1483 [1444-1562] | +1.3% |
+| convergent | 4 | 4.16 [4.12-4.22] | 4.17 [4.12-4.29] | +0.3% | 1924 [1746-2167] | 1842 [1649-1977] | -4.3% |
+| convergent | 8 | 5.79 [5.42-5.86] | 5.78 [5.48-5.79] | -0.2% | 2510 [2414-2657] | 2548 [2449-2675] | +1.5% |
+| convergent | 14 | 7.15 [6.62-7.70] | 7.40 [6.42-7.65] | +3.4% | 3151 [3083-3166] | 3229 [3045-3280] | +2.5% |
+
+| Threads | Build | adds/s | p50 ns | p99 ns | p999 ns | overflows (sum) | far (sum) | adds (sum) | walks (sum) | held by overflow / far pin (sum) | lost |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | main | 1448205 [1419204-1450825] | 1445 | 16911 [11342-18567] | 33699 [31833-56583] | 5 | 0 | 14429662 | 32841 | n/a | 0 |
+| 256 | fix | 1449768 [1438242-1454379] | 1382 | 12985 [7386-20543] | 34510 [23697-50952] | 0 | 9657379 | 14483912 | 34041 | 0 / 2 | 0 |
+| 1024 | main | 3318098 [3134067-3360214] | 2781 | 12000 [11027-12313] | 39345 [30376-42179] | 0 | 0 | 32608294 | 924 | n/a | 0 |
+| 1024 | fix | 3267548 [3203384-3321334] | 2801 | 11910 [11634-12450] | 35659 [34022-42719] | 0 | 32307767 | 32618750 | 915 | 0 / 3 | 0 |
+
+No difference beyond the run-to-run spread: every throughput and p99 cell's ranges overlap, the
+throughput deltas run from -3.2% to +3.4% (the A/A anchor gave -2.4% to +2.2% in a quieter
+session), and no cell shows the same direction at both spread and convergent keys. Bursty adds/s
+and latency percentiles match. Overflow: main overflowed 5 claims at 256 threads in one round,
+the fixed window none; 99% of 1,024-thread inserts and two thirds of 256-thread inserts took the
+far path. `STASH_HELD_STAT` counted 2 and 3 walks held by a far pin (of about 34,000 and 900
+walks) and none by overflow.
+
+### Starved stress and sanitizers
+
+| Run | main | fixed |
+|---|---|---|
+| Starved, lead 0, 40 runs | 0 failed, 0 lost of 101,768,395 | 0 failed, 0 lost of 103,268,551 |
+| Starved, lead 60, 40 runs | 0 failed, 0 lost of 104,298,595 | 0 failed, 0 lost of 102,309,006 |
+| `test.cc`, TSan and ASan+UBSan | | pass |
+| `concurrent` TSan (4 producers) and ASan+UBSan (16), lead 0 and 60, 5 runs each | | every task fired once, no reports |
+
+`sizeof(StashContext)` is still 4,352 B.
 
 ## Not built: per-slot writer counters
 

@@ -263,11 +263,14 @@ static void test_descent_window() {
 	}
 
 	// More inserts in flight than announce slots: the overflow holds first_valid
-	// where it stands until they finish, then the walk advances again.
+	// where it stands until they finish, then the walk advances again. A first
+	// walk moves the window past 6, so these inserts take the board.
 	{
 		Wheel wheel;
 		StashContext ctx(0ULL);
 		std::vector<int> got;
+		drain(wheel, ctx, 2, got);
+		auto held = ctx.atom_first_valid_key.load();
 		std::vector<std::unique_ptr<StashContext::InFlight>> slots;
 		for (size_t i = 0; i < StashContext::ANNOUNCE_SLOTS; ++i) {
 			slots.push_back(std::make_unique<StashContext::InFlight>(ctx, 6));
@@ -276,12 +279,44 @@ static void test_descent_window() {
 			StashContext::InFlight overflowed(ctx, 3);
 			assert(ctx.atom_announce_overflow.load() == 1);
 			drain(wheel, ctx, 8, got);
-			assert(ctx.atom_first_valid_key.load() == 0 && "walk passed an overflowed insert");
+			assert(ctx.atom_first_valid_key.load() == held && "walk passed an overflowed insert");
 		}
 		slots.clear();
 		drain(wheel, ctx, 8, got);
 		assert(ctx.atom_first_valid_key.load() > 3 && "first_valid stuck after the overflow drained");
 		assert(got.empty());
+	}
+
+	// A far insert (key at or past the window) counts itself in its window epoch
+	// instead of taking a slot. Stalled while the walk moves the window and walks
+	// past its key, it holds first_valid at the window it read, and the window
+	// stays put until it lands; then it fires and both move on.
+	{
+		Wheel wheel;
+		StashContext ctx(0ULL);
+		std::vector<int> got;
+		drain(wheel, ctx, 8, got);
+		auto w = ctx.atom_window.load();
+		assert(w > 7 && w < 100);
+		auto far_count = [&] {
+			unsigned n = 0;
+			for (auto& a : ctx.announce) n += a.far[0].load() + a.far[1].load();
+			return n;
+		};
+		auto in_flight = std::make_unique<StashContext::InFlight>(ctx, 100);
+		assert(in_flight->key() == 100 && far_count() == 1 && ctx.announce[0].key.load() == StashContext::IDLE);
+		drain(wheel, ctx, 90, got);
+		auto w2 = ctx.atom_window.load();
+		assert(w2 > w && ctx.far_pinned && ctx.atom_first_valid_key.load() <= w);
+		drain(wheel, ctx, 200, got);
+		assert(ctx.atom_window.load() == w2 && "window moved over a live epoch");
+		assert(ctx.atom_first_valid_key.load() <= w && "walk passed a stalled far insert");
+		wheel.put(ctx, in_flight->key(), std::make_shared<int>(100));
+		in_flight.reset();
+		drain(wheel, ctx, 200, got);
+		assert(got.size() == 1 && got[0] == 100 && "stalled far insert was lost");
+		drain(wheel, ctx, 300, got);
+		assert(ctx.atom_window.load() > w2 && ctx.atom_first_valid_key.load() > 100);
 	}
 
 	std::printf("stash OK: in-flight inserts pin first_valid; late inserts still fire\n");

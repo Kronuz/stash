@@ -4,7 +4,8 @@
 // then block (here, sleep) for a while, so only a few are inside add() at any
 // instant. One consumer walks and cleans as SchedulerQueue does. Reports insert
 // throughput, add() latency percentiles, how often the announce claim missed its
-// hinted slot or fell back to the overflow counter, and lost tasks (must be 0).
+// hinted slot or fell back to the overflow counter, how many took the far path
+// (keys past the window; 0 on builds without it), and lost tasks (must be 0).
 //
 //   bench_bursty [SECONDS] [BURST] [SLEEP_MIN_US] [SLEEP_MAX_US] THREADS...
 //   bench_bursty 2 8 500 2000 256 1024
@@ -22,11 +23,13 @@
 
 // Count the announce claim outcomes per thread (a no-op on builds without it).
 struct AnnounceStats {
-	uint64_t claims = 0, misses = 0, probes = 0, overflows = 0;
+	uint64_t claims = 0, misses = 0, probes = 0, overflows = 0, far = 0;
 };
 static thread_local AnnounceStats t_stats;
 #define STASH_ANNOUNCE_STAT(p, o) \
 	(++t_stats.claims, t_stats.misses += (p) != 0 && !(o), t_stats.probes += (o) ? 0 : (p), t_stats.overflows += (o))
+
+#define STASH_FAR_STAT() (++t_stats.far)
 
 #include "stash.h"
 
@@ -155,6 +158,7 @@ static Result run(int nthreads, double seconds, int burst, unsigned sleep_min_us
 		r.stats.misses += s.misses;
 		r.stats.probes += s.probes;
 		r.stats.overflows += s.overflows;
+		r.stats.far += s.far;
 	}
 	return r;
 }
@@ -170,19 +174,19 @@ int main(int argc, char** argv) {
 
 	printf("bench_bursty: %.1fs, bursts of %d adds, sleep %u-%u us between bursts, keys now+uniform(0,100ms)\n",
 	       seconds, burst, sleep_min, sleep_max);
-	printf("threads |    adds/s |   p50 ns |   p99 ns |  p999 ns | hint miss | probes/miss | overflow | lost\n");
+	printf("threads |    adds/s |   p50 ns |   p99 ns |  p999 ns | hint miss | probes/miss | overflow |      far | lost\n");
 	int failed = 0;
 	for (int n : threads) {
 		auto r = run(n, seconds, burst, sleep_min, sleep_max);
 		auto& s = r.stats;
 		char miss[32] = "n/a", probes[32] = "n/a", over[32] = "n/a";
-		if (s.claims) {
-			snprintf(miss, sizeof miss, "%.4f%%", 100.0 * s.misses / s.claims);
+		if (s.claims || s.far) {
+			snprintf(miss, sizeof miss, "%.4f%%", s.claims ? 100.0 * s.misses / s.claims : 0.0);
 			snprintf(probes, sizeof probes, "%.2f", s.misses ? (double)s.probes / s.misses : 0.0);
 			snprintf(over, sizeof over, "%llu", (unsigned long long)s.overflows);
 		}
-		printf("%7d | %9.0f | %8.0f | %8.0f | %8.0f | %9s | %11s | %8s | %llu\n",
-		       n, r.adds_per_sec, r.p50, r.p99, r.p999, miss, probes, over, (unsigned long long)r.lost);
+		printf("%7d | %9.0f | %8.0f | %8.0f | %8.0f | %9s | %11s | %8s | %8llu | %llu\n",
+		       n, r.adds_per_sec, r.p50, r.p99, r.p999, miss, probes, over, (unsigned long long)s.far, (unsigned long long)r.lost);
 		failed += r.lost != 0;
 	}
 	return failed ? 1 : 0;

@@ -74,6 +74,11 @@ inline T* stash_reserved() noexcept {
 #define STASH_ANNOUNCE_STAT(probes, overflowed)
 #endif
 
+// Counts an insert that took the far path (its key at or past the window).
+#ifndef STASH_FAR_STAT
+#define STASH_FAR_STAT()
+#endif
+
 
 // Each thread's preferred announce slot; it moves to wherever the thread last
 // found a free one.
@@ -97,6 +102,16 @@ struct StashContext {
 	// Announce slots: more producers in flight at once than this share one
 	// overflow counter, which holds first_valid still until they finish.
 	static constexpr size_t ANNOUNCE_SLOTS = 64;
+
+	// The window: keys below atom_window announce on the board; keys at or past
+	// it only count themselves in their epoch. A move sets the window to the
+	// floor plus WINDOW_WIDE chunks of WINDOW_CHUNK finest slots, or one chunk
+	// when the last scan found at least WINDOW_NARROW_AT slots taken; it widens
+	// again once a scan finds at most WINDOW_WIDEN_AT.
+	static constexpr unsigned long long WINDOW_CHUNK = 4;
+	static constexpr unsigned long long WINDOW_WIDE = 16;
+	static constexpr size_t WINDOW_NARROW_AT = ANNOUNCE_SLOTS / 2;
+	static constexpr size_t WINDOW_WIDEN_AT = ANNOUNCE_SLOTS / 8;
 
 	Operation op;
 
@@ -125,8 +140,11 @@ struct StashContext {
 	// add() announces its key in a slot before it touches the tree and files a
 	// key below atom_insert_floor at that floor; the walk publishes the floor,
 	// then reads the slots, and never raises first_valid above what it read.
+	// Each line also holds the far-insert counts of the two live window epochs
+	// (the window's low bit picks one), striped by the threads' remembered lines.
 	struct alignas(64) Announce {
 		std::atomic_ullong key{IDLE};
+		std::atomic<uint32_t> far[2]{};
 	};
 
 	// Consumer-only, on a line of their own: the floor last published, the
@@ -136,10 +154,18 @@ struct StashContext {
 	alignas(64) unsigned long long insert_floor;
 	unsigned long long first_valid_cap;
 	unsigned depth = 0;
+	// The window last published, the one before it (whose epoch may still have
+	// far inserts in flight), its current width, and what the last scan saw.
+	unsigned long long window;
+	unsigned long long prev_window;
+	unsigned long long window_width = WINDOW_WIDE;
+	size_t occupancy = 0;
+	bool far_pinned = false;
 
 	std::array<Announce, ANNOUNCE_SLOTS> announce;
 	alignas(64) std::atomic_ullong atom_announce_overflow{0};
 	alignas(64) std::atomic_ullong atom_insert_floor;
+	std::atomic_ullong atom_window;
 
 	StashContext(StashContext&& o) noexcept
 		: op(std::move(o.op)),
@@ -151,7 +177,13 @@ struct StashContext {
 		  pending_floor(o.pending_floor),
 		  insert_floor(o.insert_floor),
 		  first_valid_cap(o.first_valid_cap),
-		  atom_insert_floor(o.atom_insert_floor.load()) { }
+		  window(o.window),
+		  prev_window(o.prev_window),
+		  window_width(o.window_width),
+		  occupancy(o.occupancy),
+		  far_pinned(o.far_pinned),
+		  atom_insert_floor(o.atom_insert_floor.load()),
+		  atom_window(o.atom_window.load()) { }
 
 	explicit StashContext(unsigned long long begin_key)
 		: op(Operation::walk),
@@ -161,7 +193,10 @@ struct StashContext {
 		  atom_last_valid_key(begin_key),
 		  insert_floor(begin_key),
 		  first_valid_cap(begin_key),
-		  atom_insert_floor(begin_key) { }
+		  window(begin_key),
+		  prev_window(begin_key),
+		  atom_insert_floor(begin_key),
+		  atom_window(begin_key) { }
 
 	// Producer side: an insert in flight. Announces before the descent and yields
 	// the key to file under (never below the insert floor); the destructor
@@ -169,15 +204,34 @@ struct StashContext {
 	class InFlight {
 		std::atomic_ullong* slot = nullptr;
 		std::atomic_ullong* overflow = nullptr;
+		std::atomic<uint32_t>* far = nullptr;
 		unsigned long long key_;
 
 	public:
 		InFlight(StashContext& ctx, unsigned long long key) {
+			auto& hint = stash_announce_hint();
+			for (;;) {
+				auto w = ctx.atom_window.load(std::memory_order_relaxed);
+				if (key < w) {
+					break;
+				}
+				// Far: count in the epoch of the window read, then confirm it is
+				// still current. seq_cst pairs with the walk's window store and its
+				// read of the previous epoch's count (a store-load handshake).
+				auto& count = ctx.announce[hint % ANNOUNCE_SLOTS].far[w & 1];
+				count.fetch_add(1, std::memory_order_seq_cst);
+				if (ctx.atom_window.load(std::memory_order_seq_cst) == w) {
+					far = &count;
+					key_ = key;
+					STASH_FAR_STAT();
+					return;
+				}
+				count.fetch_sub(1, std::memory_order_relaxed);
+			}
 			// Announce at most the key it will file under, so the walk may advance
 			// to the current floor even while a late insert is in flight.
 			auto floor = ctx.atom_insert_floor.load(std::memory_order_relaxed);
 			auto announced = key < floor ? floor : key;
-			auto& hint = stash_announce_hint();
 			size_t i = 0;
 			for (; i < ANNOUNCE_SLOTS; ++i) {
 				auto idx = (hint + i) % ANNOUNCE_SLOTS;
@@ -207,6 +261,8 @@ struct StashContext {
 			// release: a walk that reads the slot idle sees the filled value.
 			if (slot) {
 				slot->store(IDLE, std::memory_order_release);
+			} else if (far) {
+				far->fetch_sub(1, std::memory_order_release);
 			} else {
 				overflow->fetch_sub(1, std::memory_order_release);
 			}
@@ -241,18 +297,58 @@ struct StashContext {
 			insert_floor = floor;
 			atom_insert_floor.store(floor, std::memory_order_seq_cst);
 		}
+		// Move the window a chunk before the floor reaches it, opening a new
+		// epoch: only once the previous epoch's far count has drained, since the
+		// new one reuses its parity. The new window is above the old one and of
+		// the other parity, so a producer's recheck tells them apart.
+		auto chunk = period * WINDOW_CHUNK;
+		if (!far_pinned && (insert_floor >= window || window - insert_floor < chunk)) {
+			if (occupancy >= WINDOW_NARROW_AT) {
+				window_width = chunk;
+			} else if (occupancy <= WINDOW_WIDEN_AT) {
+				window_width = chunk * WINDOW_WIDE;
+			}
+			constexpr auto max_key = std::numeric_limits<unsigned long long>::max();
+			auto w = insert_floor > max_key - window_width ? max_key - 1 : insert_floor + window_width;
+			if (w <= window) {
+				w = window + 1;
+			}
+			if ((w & 1) == (window & 1)) {
+				++w;
+			}
+			prev_window = window;
+			window = w;
+			atom_window.store(w, std::memory_order_seq_cst);
+		}
 		auto cap = insert_floor;
+		size_t taken = 0;
+		unsigned long long far_count = 0;
 		for (auto& a : announce) {
 			auto k = a.key.load(std::memory_order_seq_cst);
+			if (k != IDLE) {
+				++taken;
+			}
 			if (k < cap) {
 				cap = k;
 			}
+			far_count += a.far[prev_window & 1].load(std::memory_order_seq_cst);
 		}
 		if (atom_announce_overflow.load(std::memory_order_seq_cst)) {
+			taken = ANNOUNCE_SLOTS;
 			auto f = atom_first_valid_key.load(std::memory_order_relaxed);
 			if (f < cap) {
 				cap = f;
 			}
+		}
+		occupancy = taken;
+		// Far inserts of the current epoch have keys at or past the window; those
+		// of the previous one, at or past the previous window.
+		if (window < cap) {
+			cap = window;
+		}
+		far_pinned = far_count != 0;
+		if (far_pinned && prev_window < cap) {
+			cap = prev_window;
 		}
 		first_valid_cap = cap;
 	}

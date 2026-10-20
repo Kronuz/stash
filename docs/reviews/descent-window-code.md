@@ -371,3 +371,144 @@ None.
   in both builds, so those rows show no difference between base and the fix.
 - Building Xapiand, Kronuz/scheduler or Detent against the branch.
 - CI: run 39364572180 not inspected per platform.
+
+## Re-check
+
+Scope: `git log 9e2ebd8..90078ab` (12982b1, a69ab07, 2660a14, abf2a3f, 90078ab), re-checked from this
+worktree at `90078ab`, macOS x86_64, under `quiet check` (light hold at first, then free for the
+starved runs). Probes, model and mutants are the ones kept in `.scratch/`; the re-check's own
+artifacts are in `.scratch/rc/`.
+
+### Verdicts
+
+| Finding | Verdict | Where |
+|---|---|---|
+| DW1 | CLOSED | `test/test.cc:242-263` |
+| DW3 | CLOSED | `docs/API.md:54-61`, `AGENTS.md:96-99`, `ARCHITECTURE.md:499-501` |
+| DW4 | CLOSED | `stash.h:136-142` |
+| DW5 | CLOSED | `AGENTS.md:129-135`, `ARCHITECTURE.md:492-498` |
+| DW6 | CLOSED | `ARCHITECTURE.md:323-335` |
+| DW10 | CLOSED | `docs/API.md:11-14`, `ARCHITECTURE.md:312-321`, `stash.h:686` |
+| Item 6 (clean context's announce array) | Claim holds; nothing to do | see below |
+
+**DW1.** The new block in `test_descent_window` is P1 verbatim: it adds 55 at key 5, holds an
+`InFlight` at 3, starts the walk with `begin_key = first_valid`, takes the 55 on call 1, lands 33
+at 3 and retracts, continues to the end of the walk, and then expects 33 on the next walk. I copied
+`stash.h` and removed only the `begin_key > atom_first_valid_key` clause of `refresh_first_valid_cap`
+(`stash.h:230-231`, the d7dc92b guard). Same compiler, `-std=c++17 -O2 -g`, asserts live:
+
+- tip: `all stash tests passed`, rc 0.
+- guard reverted: `Assertion failed: (got.size() == 1 && got[0] == 33 && "continuation walk
+  stranded a landed insert"), function test_descent_window, file test.cc, line 262`, rc 134.
+
+The test is deterministic (no threads). It is the only `test.cc` check that fails on the revert.
+
+**DW3.** The contract is written three times, and matches the code (`stash.h:230-232` returns when
+`begin_key > first_valid`). `docs/API.md:54-61` (the `next` entry) says to start every walk with
+`begin_key = atom_first_valid_key` and `pending_floor = IDLE`, allows continuing with further `next`
+calls, and states the consequence: no refresh, `first_valid` stops, `clean` frees nothing, `add`
+throws past one span. `AGENTS.md:96-99` has it as an invariant. `ARCHITECTURE.md:499-501` has it
+under limitations. I reran P7 (`probe_no_reset.cc`): `fired=8 add-throws=32 first_valid=1`, the
+consequence the docs now describe. No assert was added; I had offered one as optional.
+
+**DW4.** Layout, printed by `offsetof` (`.scratch/rc/layout.cc`) with `static_assert`s that compile
+at the tip and fail on the old layout (`.scratch/mutants/every_call/stash.h` is 9e2ebd8's layout):
+
+| Field | Offset | Line |
+|---|---|---|
+| `begin_key` / `atom_first_valid_key` | 8 / 24 | 0 |
+| `insert_floor` / `first_valid_cap` / `depth` | 64 / 72 / 80 | 1 |
+| `announce[0]` | 128 | 2 |
+| `atom_announce_overflow` | 4224 | 66 |
+| `atom_insert_floor` | 4288 | 67, alone: `sizeof` 4,352 = 4,288 + 64 |
+
+So the three consumer-only fields are off the floor's line, and the floor owns its line: it is the
+last member, 64-aligned, and the struct is padded to the line. P4 prints "depth line 1, floor line 67"
+and passes. `sizeof(StashContext)` goes from 4,288 to 4,352 (+64), which the commit message states.
+The memory orders are unchanged by the move. The diff of `stash.h` over 9e2ebd8 only reorders the
+members and their initializers (the initializer list follows the new declaration order, so no
+`-Wreorder`), adds the no-op `STASH_ANNOUNCE_STAT` hook, hoists `i` out of the claim loop, and fixes
+the message. I reran `handshake_model.py` anyway, in both styles:
+
+- fix, cont and sched, 2 and 1 slots: no violation, with the same state counts as `results.txt`
+  (4,312,130; 4,701,701; 5,089,854; 5,510,573).
+- `every_call`, cont: LOSS (101,694 and 148,053 states, as before); sched: no violation.
+
+The model does not see layout; that part rests on the offset check above. Not measured (no
+benchmarks run); the developer's `bench-dw4.log` and `bursty-dw4.log` exist and were not re-run.
+
+**DW5 and DW10.**
+
+1. Long-stall throw: `AGENTS.md:129-135` and `ARCHITECTURE.md:492-498` now say that a stall past one
+   span (less `horizon_margin`) makes every `add` throw, overdue keys included, that the scheduler
+   drops them, that `clean` frees nothing above the pin, and that each walk re-walks the pinned range.
+   They name the three things that can hold `add` (preemption, `malloc`, a page fault) and the two
+   wheels (impossible on the scheduler's 24 h wheel, 4 s on `test/concurrent.cc`'s). This matches P3.
+2. `docs/API.md:11-14` now reads "`add` raises `atom_last_valid_key`; only the walk writes
+   `atom_first_valid_key`". True of the code: the only store to `atom_first_valid_key` is the CAS in
+   `next` (`stash.h:636`).
+3. Refresh cost, `ARCHITECTURE.md:312-321`: once per finest slot, one store and one pass over the 64
+   slot lines, only while unpinned; while `first_valid_cap < insert_floor` every call that starts at
+   `first_valid` re-reads all 64 lines, once per task under the scheduler. This is the wording I asked
+   for, and matches `stash.h:236`.
+4. `stash.h:686` throws `"stash overflow"`. Nothing else in the tree spells it `overlow`
+   (`grep` finds only my review's quote of it). No test matches on the message.
+
+While there: the comment on `depth` now says the floor is refreshed "at depth 1", which matches
+`stash.h:536`; the review had mis-stated it as depth 0.
+
+**DW6.** `ARCHITECTURE.md:323-335` ("Why 64 slots") gives the argument: slots bound inserts inside
+`add` at once, not threads; an `add` costs 0.5 to 1 µs; so runnable producers times the fraction of
+CPU spent in `add`; overflow is correct (the counter holds `first_valid` until a refresh reads zero)
+and not sticky. Its numbers match the review's probe table (1,000 threads with a 1 ms pause: 0% of
+walks overflowed; only 1,000 back-to-back adders did, where main's consumer is already starved). It
+points at `bench/bench_bursty.cc` for the hint-miss and overflow rates. I compiled `bench_bursty.cc`
+(`-std=c++20 -Wall -Wextra`) and `test.cc` (`-Wall -Wextra`) with no warnings from `stash.h`; I did
+not run the bench. One sentence in that paragraph is an assertion, not a measurement: "per-thread
+slots would not scale ... thousands of threads would exhaust any table a walk can afford to scan".
+It follows from the hazards listed above in "Per-thread announce ownership", so I leave it.
+
+**Item 6 (the clean context's announce array).** The developer's claim holds. The announce array is
+read in exactly two places: `InFlight` (`stash.h:184`, producers, which never touch the clean context)
+and `refresh_first_valid_cap` (`:245`, which returns early for `op != walk`). So the clean context
+never uses its 4.2 KB. But `next`, `put` and `add` all take one `StashContext&` (18 uses in
+`stash.h`), and the walk context needs the array, so removing it from the clean context needs either
+a second context type with templated or overloaded `next` for both (a public API change that the
+pinned Kronuz/scheduler would have to follow), or a pointer to heap-allocated slots (an indirection on
+the producers' hot path, and a change to the layout just fixed in DW4). The saving is 4.3 KB times 8
+schedulers, about 34 KB per Xapiand process. Not worth it; leave as is.
+
+### Test suite, TSan, starved stress
+
+All at the tip (`90078ab`):
+
+| Run | Result |
+|---|---|
+| CTest, `-O2 -g`, asserts live (`.scratch/build-tip`) | 2/2 pass (`stash` 0.26 s, `stash_concurrent` `4 2.0 32 0 0` 2.5 s) |
+| TSan (Homebrew clang 23.1.2, `-O1 -g -fsanitize=thread`): `test.cc` | all passed |
+| TSan: `concurrent 4 2.0 32 0 0`, 5 runs | 0 warnings, 5/5 "every task fired exactly once" (about 4.65M tasks) |
+| `starve_ab.sh 10 48 4 2.0` (48 hogs, nice 19 test, 4 producers, lead 0), main vs tip, interleaved | main: 2 of 10 runs failed, 2 lost of 22,901,132; tip: 0 failed, 0 lost of 22,523,270 |
+
+The starved runs started when `quiet check` returned 0 (a light hold cleared early); the TSan and
+CTest runs were at `nice -n 19` under the light hold. Main's two failures are the descent window
+reproducing on this run (each a final drain of 10 s that still missed one task).
+
+### New findings
+
+None. The abf2a3f diff is limited to the member reorder and the message fix; the 12982b1 hook is a
+no-op macro unless a consumer defines it.
+
+### Blocking
+
+Nothing blocks landing. All six conditions are closed.
+
+### Not run
+
+- Benchmarks of any kind (DW4's effect on throughput is unmeasured here; the developer's
+  `bench-dw4.log` and `bursty-dw4.log` were not re-run), and `bench_bursty` itself (compiled only).
+- ASan/UBSan (not in scope for this re-check; the diff over 9e2ebd8 adds no allocation or pointer
+  logic).
+- A weak-memory model checker, Linux and arm64, CI on the tip, and building Kronuz/scheduler or
+  Xapiand against the branch.
+- The mutants other than `every_call` (the revert of d7dc92b), which was run as a fresh revert of the
+  guard on the tip's `stash.h`.

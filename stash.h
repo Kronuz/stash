@@ -158,7 +158,7 @@ struct StashContext {
 	// far inserts in flight), its current width, and what the last scan saw.
 	unsigned long long window;
 	unsigned long long prev_window;
-	unsigned long long window_width = WINDOW_WIDE;
+	unsigned long long window_width = 0;   // set at the first move
 	size_t occupancy = 0;
 	bool far_pinned = false;
 
@@ -305,7 +305,7 @@ struct StashContext {
 		if (!far_pinned && (insert_floor >= window || window - insert_floor < chunk)) {
 			if (occupancy >= WINDOW_NARROW_AT) {
 				window_width = chunk;
-			} else if (occupancy <= WINDOW_WIDEN_AT) {
+			} else if (occupancy <= WINDOW_WIDEN_AT || !window_width) {
 				window_width = chunk * WINDOW_WIDE;
 			}
 			constexpr auto max_key = std::numeric_limits<unsigned long long>::max();

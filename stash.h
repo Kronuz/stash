@@ -956,15 +956,18 @@ public:
 		// so the consumer can reach it the instant the bound below is published.
 		// relaxed: the slot index is private, and the claim is made visible to the
 		// consumer's pending check by the bound's release-store below.
+		// A retry stays in the chunk (a pointer bump) or resumes the chain walk from
+		// the node it reached (the cursor), so the load-to-CAS window stays short.
+		typename Stash_T::Cursor cursor;
 		std::atomic<_Tp*>* ptr_atom_ptr;
 		auto slot = atom_end.load(std::memory_order_relaxed);
-		Stash_T::get(&ptr_atom_ptr, slot, true);
+		Stash_T::get(&ptr_atom_ptr, slot, true, cursor);
 		for (auto got = slot; !atom_end.compare_exchange_weak(slot, slot + 1,
 		         std::memory_order_relaxed, std::memory_order_relaxed); got = slot) {
 			if (slot / _Size == got / _Size) {
 				ptr_atom_ptr += slot - got;   // same chunk: no walk, no allocation
 			} else {
-				Stash_T::get(&ptr_atom_ptr, slot, true);
+				Stash_T::get(&ptr_atom_ptr, slot, true, cursor);
 			}
 		}
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}slot:{}, atom_end:{}, op:{}", ctx._col(), slot, atom_end.load(), ctx._op());

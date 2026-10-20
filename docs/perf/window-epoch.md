@@ -257,6 +257,70 @@ walks) and none by overflow.
 
 `sizeof(StashContext)` is still 4,352 B.
 
+## Allocation failure before the reserve (DW11, b458364)
+
+`StashValues::put` claimed its slot first and allocated after (the slot's chunk and the value
+box), so a `std::bad_alloc` left a reserved slot that never filled: a hole the walk parks on for
+good, pinning `first_valid`. Kronuz/scheduler now reports `bad_alloc` as `no_memory` and keeps
+running, which made it reachable. `put` now builds the value box and materializes the slot's
+chunk at `atom_end` first, then claims that slot with a CAS of `atom_end`; nothing can fail
+after the claim.
+
+`test_alloc_failure` fails each allocation site in turn (`STASH_ALLOC_HOOK`), on a fresh leaf and
+on a full leaf chunk, and checks that the walk still moves `first_valid` past the key and that an
+add one span out is accepted. On the previous `put` it fails (`first_valid` stays at the key).
+
+The model gains `abort=1` (a producer fails at its descent, before the reserve, and releases its
+announce or far count through `InFlight`'s destructor) and a HOLE invariant: once every producer
+is done, no reserved slot may be left unfilled. `run_abort.sh`, results in `results-abort.txt`.
+
+| Configuration | States | Verdict |
+|---|---|---|
+| fixed window, sched / cont, 1 slot, width 2, abort | 14,146,892 / 14,715,512 | no violation |
+| fixed window, 2 slots, width 2, abort | 4,589,024 | no violation |
+| main, sched, 2 slots, abort | 1,121,131 | no violation |
+| mutant: abort after the reserve, window / main | 204 / 144 | HOLE: reserved slot left unfilled |
+| unchanged configs under the HOLE check (window sched width 2, main cont) | 10,094,389 / 831,991 | no violation |
+
+TSan and ASan+UBSan on `test.cc` (with `test_alloc_failure`) and on `concurrent.cc` (lead 0 and
+60, 5 runs each): every task fired once, no reports.
+
+### Cost of claiming by CAS
+
+Claiming after allocating needs a CAS on `atom_end` instead of a fetch-add. A/B against the
+fetch-add build (the fixed-width window at d234d24), same harness and method, 3 interleaved rounds
+under a strict hold; `.scratch/logs/ab-dw11c.log`, summary `ab-dw11c-summary.md`. The retry
+resumes the chain walk from a local cursor; the first version, which re-walked from the head,
+lost 31% at 14 convergent threads (`ab-dw11-summary.md`).
+
+| Keys | Threads | fix Mops | dw11c Mops | Δ | fix p99 ns | dw11c p99 ns | Δ p99 |
+|---|---|---|---|---|---|---|---|
+| spread | 1 | 1.02 [1.00-1.06] | 1.03 [1.02-1.06] | +1.2% | 1697 [1585-1718] | 1634 [1601-1715] | -3.7% |
+| spread | 2 | 1.44 [1.42-1.50] | 1.45 [1.43-1.48] | +0.6% | 2270 [2151-2305] | 2278 [2158-2293] | +0.4% |
+| spread | 4 | 2.03 [2.03-2.05] | 2.04 [2.03-2.08] | +0.5% | 3207 [3142-3279] | 3236 [3073-3237] | +0.9% |
+| spread | 8 | 2.70 [2.57-2.81] | 2.64 [2.55-2.82] | -2.4% | 4576 [4473-4652] | 4419 [4413-4603] | -3.4% |
+| spread | 14 | 3.68 [3.66-4.00] | 3.69 [3.56-3.79] | +0.4% | 6491 [6358-6854] | 6724 [6640-6889] | +3.6% |
+| convergent | 1 | 1.93 [1.86-1.98] | 1.88 [1.85-2.00] | -2.8% | 745 [716-758] | 770 [692-785] | +3.4% |
+| convergent | 2 | 2.38 [2.31-2.41] | 2.31 [2.29-2.38] | -3.1% | 1445 [1434-1452] | 1482 [1441-1503] | +2.6% |
+| convergent | 4 | 4.21 [4.21-4.23] | 4.04 [4.04-4.14] | -4.2% | 1733 [1711-1969] | 1698 [1655-1698] | -2.0% |
+| convergent | 8 | 5.57 [5.55-5.84] | 5.25 [5.23-5.29] | -5.8% | 2531 [2417-2572] | 2657 [2599-2682] | +5.0% |
+| convergent | 14 | 7.27 [7.13-7.56] | 6.05 [6.02-6.21] | -16.7% | 3212 [3138-3267] | 4347 [4309-4589] | +35.3% |
+
+| Threads | Build | adds/s | p50 ns | p99 ns | p999 ns | overflows (sum) | far (sum) | adds (sum) | walks (sum) | held by overflow / far pin (sum) | lost |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | fix | 1449189 [1445930-1452932] | 1351 | 13828 [5799-17839] | 32927 [22796-40523] | 0 | 5807007 | 8696102 | 23911 | 0 / 0 | 0 |
+| 256 | dw11c | 1445710 [1430527-1461252] | 1496 | 11464 [7715-13385] | 34486 [25178-37610] | 0 | 5775147 | 8674978 | 24095 | 0 / 0 | 0 |
+| 1024 | fix | 3269762 [3239200-3310684] | 2803 | 12073 [11975-12179] | 40674 [35976-41700] | 0 | 19443217 | 19639292 | 534 | 0 / 2 | 0 |
+| 1024 | dw11c | 3110624 [3104357-3295517] | 2818 | 12650 [12090-12892] | 44655 [40309-47338] | 0 | 18855955 | 19020996 | 549 | 0 / 3 | 0 |
+
+Spread keys and bursty are within the spread. Convergent keys, where every producer hits one leaf,
+lose 4.2% at 4 threads, 5.8% at 8 and 16.7% at 14, with p99 35% higher at 14; the ranges do not
+overlap. This is the CAS's contention on the hot leaf, not the allocation order. A fetch-add claim
+that never leaves a hole needs storage materialized for any slot a racing claim can land on,
+which no bounded look-ahead guarantees; the alternatives (marking the failed slot drained, which
+needs its storage to exist, or a shared drained chunk for a failed chunk) are listed for the
+owner in the ledger.
+
 ## Not built: per-slot writer counters
 
 The first idea in this round counted writers on the slots being descended into, instead of the

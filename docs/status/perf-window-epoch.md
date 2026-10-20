@@ -35,3 +35,13 @@ handshake; not merged. Results in `docs/perf/window-epoch.md` ("Fixed width" for
 ## Blocked on
 
 Nothing.
+
+## For reviewers
+
+- DW11 (descent-window review) is now reachable in production: Kronuz/scheduler maps
+  `std::bad_alloc` from `add` to `schedule_result::no_memory` and keeps running. A
+  `bad_alloc` after `StashValues::put` reserved its slot (the value box, or a leaf chunk) leaves
+  a reserved hole that pins `first_valid` through `pending_floor` for good: no reclamation, and
+  after one span every `add` returns false. Before, the exception escaped the scheduler. The fix
+  belongs here (mark the reserved slot drained on failure, and handle a chunk that never
+  materialized); not built, pending the owner and the architect.

@@ -309,13 +309,30 @@ A snapshot only covers reads made after it, so the walk refreshes it from the
 outermost `StashSlots::next` and only on a call that starts at `first_valid`: a
 walk of several `next` calls continues from `begin_key`, and a snapshot taken on
 a later call would miss inserts that finished in ranges the earlier calls already
-passed. It refreshes at most once per finest slot (`StashSlots::finest_div`), so
-it costs one store and one pass over the slots per millisecond on Xapiand's
-wheel, not per task. While a snapshot shows
-a late announce holding it back, the walk re-reads the slots on each pass until
-the announce clears. More producers in flight than slots share
-`atom_announce_overflow`; while it is non-zero the cap is wherever `first_valid`
-stands, so the walk does not advance it until they finish.
+passed. Normally it refreshes at most once per finest slot
+(`StashSlots::finest_div`): one store and one pass over the 64 slot lines per
+millisecond on Xapiand's wheel. While a snapshot is pinned (`first_valid_cap <
+insert_floor`, a late announce or the overflow counter holding it back), every
+call that starts at `first_valid` re-reads all 64 lines; under the scheduler,
+whose `walk()` starts there on every call, that is once per task until the
+announce clears. More producers in flight than slots share
+`atom_announce_overflow`; while it is non-zero at a refresh the cap is wherever
+`first_valid` stands, so the walk does not advance it until a refresh sees it at
+zero.
+
+**Why 64 slots.** A slot is held only while an insert is inside `add`, which
+never blocks, so the slots bound inserts in flight at once, not threads: about
+the runnable producers times the fraction of their CPU spent in `add`. An `add`
+costs 0.5 to 1 µs, and a request thread that logs a few lines spends well under
+1% of its time there, so hundreds to thousands of request threads, mostly
+blocked on search, indexing or I/O, keep a handful in `add` at once. Running out
+is still correct: the overflow counter holds `first_valid` still until a refresh
+reads it at zero, and is not sticky. In the review's probes on Xapiand's wheel,
+1,000 threads pausing 1 ms between adds never overflowed (0% of walks); only
+1,000 threads adding back to back did, where main's single consumer was already
+starved. `bench/bench_bursty.cc` measures the hint-miss and overflow rates
+directly. Per-thread slots would not scale to that workload: thousands of
+threads would exhaust any table a walk can afford to scan.
 
 The visible change is for keys already overdue: a key below the floor (the last
 walk's end) is filed at the floor instead of lowering `first_valid` to it. It
@@ -475,7 +492,13 @@ latencies.
 - **Pending leaves and in-flight inserts pin the walk.** A producer preempted
   between reserving and filling a slot holds its leaf, and everything after it in
   that leaf, until it resumes; one preempted anywhere in `add` holds
-  `first_valid`. The values are re-drained on the next pass, never lost.
+  `first_valid`. The values are re-drained on the next pass, never lost, but
+  `clean` frees nothing above the pin and each walk re-walks the pinned range. A
+  stall longer than one span (less `horizon_margin`) makes every `add` throw,
+  overdue keys included, because the floor they are filed at is past the horizon.
+- **Every walk starts at `first_valid`.** A consumer that carries `begin_key` over
+  from its previous walk never refreshes the in-flight snapshot, so `first_valid`
+  freezes; continuing one walk with more `next` calls is fine.
 - **`put` skips the announce.** It is the unchecked insert under `add`; calling it
   concurrently with a walk reopens the descent window.
 - **Manual destructor teardown.** `Data::~Data` tears the

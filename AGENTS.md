@@ -93,6 +93,10 @@ Breaking one of these produces silent loss or a race, not a compile error.
   passed. That store-load pair keeps `first_valid` at or below every insert in
   flight; weakening either side to acquire/release reopens the descent window.
   `first_valid <= atom_insert_floor` always.
+- **Every walk starts at `begin_key = atom_first_valid_key`.** The snapshot is
+  refreshed only on such a call; a consumer that carries `begin_key` over from its
+  previous walk freezes `first_valid` (no `clean`, and `add` throws past one span).
+  Continuing a walk with further `next` calls is fine.
 - **Pointer-like, non-null values.** The walk's liveness test is `*ptr && **ptr`;
   a null or "zero" value reads as absent.
 
@@ -123,7 +127,12 @@ Breaking one of these produces silent loss or a race, not a compile error.
   racing the walk can be skipped or freed under; `add` is the concurrent entry
   point.
 - **A stalled producer pins `first_valid`.** Its announce holds the low-water mark
-  (and so `clean` and the horizon) until it resumes; walks keep firing above it.
+  (and so `clean` and the horizon) until it resumes; walks keep firing above it,
+  each re-walking the pinned range. A stall longer than one wheel span (less
+  `horizon_margin`) makes every `add` throw, overdue keys included, since they are
+  filed at the floor; the scheduler drops those tasks. `add` never blocks, so only
+  preemption, `malloc` or a page fault can hold it: impossible in practice on the
+  scheduler's 24 h wheel, 4 s on `test/concurrent.cc`'s.
 - **Destruction is manual and not concurrent.** `Data::~Data` frees the node
   chain and chunks by hand; destroy a structure only when no producer or consumer
   touches it.

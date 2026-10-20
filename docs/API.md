@@ -9,8 +9,9 @@ Carries the state for a single traversal.
 - `begin_key` / `end_key` — the half-open key window `[begin_key, end_key)` the
   traversal covers. `end_key == 0` means "no upper bound from the window."
 - `atom_first_valid_key` / `atom_last_valid_key` — atomic bounds on where live
-  data is. `add` widens them; the walk advances `atom_first_valid_key` so the
-  next pass can skip ranges already drained.
+  data is. `add` raises `atom_last_valid_key`; only the walk writes
+  `atom_first_valid_key`, advancing it so the next pass can skip ranges already
+  drained.
 - `horizon_margin` — keys within this distance of the wheel's span are
   rejected by `add`, so a near-horizon insert cannot alias a slot one period
   below. 0 (off) by default; see ARCHITECTURE.md.
@@ -51,7 +52,13 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
 - `finest_div` — the finest slot width below this level; the walk refreshes its
   in-flight snapshot at most once per `finest_div` keys.
 - `next(ctx, value_ptr [, limit_key])` — walks the key window in `ctx.op` mode,
-  recursing into the child level, returning the first matching value.
+  recursing into the child level, returning the first matching value. Start
+  every walk with `ctx.begin_key = ctx.atom_first_valid_key` (and
+  `pending_floor = IDLE`); a walk may then call `next` again to continue from
+  where it stopped. The walk refreshes its in-flight snapshot only on a call that
+  starts at `first_valid`, so a consumer that carries `begin_key` over from its
+  previous walk never refreshes: `first_valid` stops advancing, `clean` frees
+  nothing, and `add` throws once keys pass one span.
 
 ## `StashValues<T, Size>`
 

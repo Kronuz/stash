@@ -177,3 +177,21 @@ to none measured. It meets the owner's bar to land, with two caveats for the rev
 main is a bounded, non-sticky freeze of `first_valid`, so the win is in tail cleanup delay, not in
 correctness or throughput; and the shrink never engaged on these workloads, so it is safe (model,
 always-narrowing stress) but its benefit is unmeasured. Not measured on Linux or arm64 beyond CI.
+
+## Not built: per-slot writer counters
+
+The first idea in this round counted writers on the slots being descended into, instead of the
+board. The owner dropped it before a prototype (the board's uncontended writes beat RMWs on hot
+slots), so there are no numbers; the design analysis is kept for the question it raised, which
+level would hold the counter.
+
+Only the outermost level can hold it alone. The walk skips a null child, a short or empty chunk
+chain, and everything past `last_valid`, and lower nodes are created lazily, so a counter inside a
+lower node either does not exist yet when the producer needs it or is never read by a walk that
+skipped the node's parent. The outermost level's slots live in the wheel object itself and are read
+for every range the walk passes, but they are 18 s wide on Xapiand's wheel: the walk could hold
+`first_valid` only at the 18 s slot's start, and under steady load some producer is always inside
+the current slot. Finer precision needs hand-over-hand counting down the levels (increment the
+child's counter, then release the parent's), two RMWs per level on counters every producer in the
+same 18 s, 500 ms and 50 ms span shares. The cost would have been 4 B per slot at every level (19.2
+KB eagerly on the outermost 4,800-slot level).

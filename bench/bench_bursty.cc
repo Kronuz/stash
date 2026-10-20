@@ -132,7 +132,7 @@ static Result run(int nthreads, double seconds, int burst, unsigned sleep_min_us
 				for (int b = 0; b < burst; ++b) {
 					auto task = std::make_shared<Task>(++id);
 					auto t0 = now_ns();
-					if (wheel->add(ctx, t0 + lead(rng), task)) {
+					if (wheel->add(ctx, t0 + lead(rng), task) == stash_result::placed) {
 						auto dt = now_ns() - t0;
 						my.push_back(dt > UINT32_MAX ? UINT32_MAX : (uint32_t)dt);
 						added.fetch_add(1, std::memory_order_relaxed);

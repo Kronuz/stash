@@ -124,9 +124,11 @@ allocation on a lost race. Then it forwards `put` to the child. The recursion bo
 `add(ctx, key, args...)` is `put` with an announce and bounds checking. It first
 announces the insert (see "Inserts in flight" below), which may raise a key that is
 already overdue to the insert floor. It then checks
-`key >= get_end_base_key(ctx.atom_first_valid_key.load())` and returns false,
-storing nothing, if the key is more than one wheel span past the first valid key;
-otherwise it places the value and returns true. Only allocation failure throws.
+`key >= get_end_base_key(ctx.atom_first_valid_key.load())` and returns
+`stash_result::past_horizon`, storing nothing, if the key is more than one wheel
+span past the first valid key; otherwise it places the value and returns `placed`.
+It is `noexcept`: a `std::bad_alloc` before the leaf claim returns `no_memory`
+(next section for after it).
 The leaf raises `atom_last_valid_key` toward `key` before filling the slot; that
 bound is what lets the walk skip empty key ranges.
 Producers never write `atom_first_valid_key`; only the walk does.
@@ -148,18 +150,20 @@ Each leaf slot is in one of three states, which the walk reads directly:
 **reserved** (it holds the sentinel `stash_reserved<T>()`), **filled** (a value
 pointer), or **drained** (null).
 
-`put` appends, and does everything that can throw before it claims a slot: it
-builds the value box, materializes the chunk holding the next slot
-(`Stash_T::get(..., true)` at `atom_end`), and only then claims that slot with a
-CAS of `atom_end` from it to the next (a failed CAS moves to the new end, within
-the same chunk without another walk). A reserved slot that is never filled is a
-hole the walk parks on forever, pinning `first_valid`, so after the claim nothing
-can fail: the value goes into the slot with a CAS over the sentinel. A failed
-allocation (`std::bad_alloc`, or the value's constructor) therefore reserves
-nothing, and `add`'s `InFlight` still retracts the announce. A chunk is filled
-with sentinels before it is published, so a claimed slot reads as reserved until
-its value lands. The `key` argument is unused at the leaf; ordering comes from the
-slot levels above it.
+`put` appends: it builds the value box first, then claims a slot with
+`auto slot = atom_end++` (an atomic fetch-add, so concurrent appenders get
+distinct slots), materializes storage at that slot via `Stash_T::get(..., true)`,
+and installs the value with a CAS over the sentinel. A chunk is filled with
+sentinels before it is published, so a claimed slot reads as reserved until its
+value lands. A claimed slot that is never filled is a hole the walk parks on
+forever, pinning `first_valid`, so the order is fail-fast: a `std::bad_alloc`
+building the value box (before the claim) makes `add` return `no_memory` with
+nothing claimed, and one materializing the slot's chunk or chain node (after the
+claim) terminates the process through `stash_out_of_memory_after_claim`, which
+writes "stash: out of memory after claiming a slot" to stderr. Claiming by CAS after
+materializing would avoid the termination, but it cost up to 16.7% on one hot leaf
+([docs/perf/window-epoch.md](docs/perf/window-epoch.md)). The `key` argument is
+unused at the leaf; ordering comes from the slot levels above it.
 
 The walk parks `walk_cur` on the first reserved slot: it drains ready values
 beyond it but never steps past an unfilled hole, so the leaf stays pinned until
@@ -391,10 +395,9 @@ removed; [STRAND_FIX.md](STRAND_FIX.md) records that change.
 The structure is many-producer, single-consumer:
 
 - **Producers (`add`/`put`)** are lock-free. Every structural mutation (a node,
-  a chunk, a child level, a leaf slot, a value) goes through a
-  `compare_exchange`: the leaf's slot claim on `atom_end`, or an
-  allocate-then-`compare_exchange` publish that discards the loser's allocation.
-  No producer ever blocks another.
+  a chunk, a child level, a leaf slot, a value) goes through an atomic fetch-add
+  (`atom_end++`) or an allocate-then-`compare_exchange` publish that discards the
+  loser's allocation. No producer ever blocks another.
 - **One consumer** runs `walk`, `peep`, and `clean`, one at a time. They mutate
   the non-atomic cursors and `ctx.begin_key`/`end_key`; two consumers, or `clean`
   concurrent with `walk`, is undefined behavior.
@@ -486,7 +489,7 @@ For a wheel of `L` nested slot levels:
 
 - **Insert** (`add`/`put`) is `O(L)` slot computations plus, in the worst case,
   one chunk/node allocation per untouched level. For the leaf, `O(1)` amortized
-  append (one CAS, retried on contention). When a single chunk overflows `Size`, `Data::get`
+  append (one fetch-add). When a single chunk overflows `Size`, `Data::get`
   walks `slot / Size` nodes, so a heavily populated single level degrades toward
   `O(slot / Size)` node hops.
 - **Walk** visits each non-empty slot at most once per level; with the atomic
@@ -539,7 +542,7 @@ latencies.
   that leaf, until it resumes; one preempted anywhere in `add` holds
   `first_valid`. The values are re-drained on the next pass, never lost, but
   `clean` frees nothing above the pin and each walk re-walks the pinned range. A
-  stall longer than one span (less `horizon_margin`) makes every `add` return false,
+  stall longer than one span (less `horizon_margin`) makes every `add` return `past_horizon`,
   overdue keys included, because the floor they are filed at is past the horizon.
 - **Every walk starts at `first_valid`.** A consumer that carries `begin_key` over
   from its previous walk never refreshes the in-flight snapshot, so `first_valid`
@@ -551,7 +554,7 @@ latencies.
   deletes every value pointer in the chunk, then the chunk. It swallows
   exceptions through `L_EXC`. Destruction is not concurrency-safe and assumes no walker
   or producer is active.
-- **Overflow is refused, not stored.** `add` returns false when a key is more
+- **Overflow is refused, not stored.** `add` returns `past_horizon` when a key is more
   than one wheel span (less `horizon_margin`) past `atom_first_valid_key`. The
   caller (a scheduler) keeps keys within the live window by draining the wheel as
   the clock advances, and must check the result to know a value was refused.

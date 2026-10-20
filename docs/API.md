@@ -60,12 +60,18 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
 - `add(ctx, key, args...)` — `put` plus the in-flight announce and bound
   maintenance, safe to call from many threads while one consumer walks. A key
   below `atom_insert_floor` (overdue past the last walk's end) is filed at the
-  floor; it fires on the next walk. Returns true once the value is placed, and
-  false, storing nothing, if the key is beyond the wheel span `[first_valid_key,
-  first_valid_key + Div*Mod)` (less `horizon_margin`). Throws only
-  `std::bad_alloc` (or what the value's constructor throws), always before the
-  leaf slot is claimed: a failed `add` stores nothing, releases its announce and
-  leaves no hole, so the walk keeps advancing `first_valid`.
+  floor; it fires on the next walk. `noexcept`; returns a `stash_result`:
+  `placed`, `past_horizon` (the key is beyond the wheel span `[first_valid_key,
+  first_valid_key + Div*Mod)`, less `horizon_margin`) or `no_memory` (an
+  allocation before the leaf slot is claimed failed: a level above the leaf or the
+  value box). The last two store nothing and release the announce, so the walk
+  keeps advancing `first_valid`. An allocation that fails after the claim (the
+  leaf's chunk or a new chain node) terminates the process with "stash: out of
+  memory after claiming a slot": an unfilled claimed slot would pin `first_valid`
+  for good. A value constructor that throws anything but `std::bad_alloc` also
+  terminates.
+- `enum class stash_result : std::uint8_t { placed, past_horizon, no_memory }` —
+  what `add` did; only `placed` stores the value.
 - `finest_div` — the finest slot width below this level; the walk refreshes its
   in-flight snapshot at most once per `finest_div` keys.
 - `next(ctx, value_ptr [, limit_key])` — walks the key window in `ctx.op` mode,
@@ -75,7 +81,7 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
   where it stopped. The walk refreshes its in-flight snapshot only on a call that
   starts at `first_valid`, so a consumer that carries `begin_key` over from its
   previous walk never refreshes: `first_valid` stops advancing, `clean` frees
-  nothing, and `add` returns false once keys pass one span. `noexcept` whenever
+  nothing, and `add` returns `past_horizon` once keys pass one span. `noexcept` whenever
   the leaf's value operations are (`StashValues::nothrow_next<T>`: copy-assign,
   bool tests, destructor); it never allocates.
 

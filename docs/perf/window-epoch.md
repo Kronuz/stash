@@ -321,6 +321,46 @@ which no bounded look-ahead guarantees; the alternatives (marking the failed slo
 needs its storage to exist, or a shared drained chunk for a failed chunk) are listed for the
 owner in the ledger.
 
+### Fail fast instead (owner's decision)
+
+The owner chose not to pay the CAS's cost. The claim is a fetch-add again; the value box is still
+built before it, so a `std::bad_alloc` there claims nothing and `add` (now `noexcept`, returning
+`stash_result { placed, past_horizon, no_memory }`) returns `no_memory`. A failure that can only
+happen after the claim (the slot's chunk or a new chain node) calls
+`stash_out_of_memory_after_claim`, which writes "stash: out of memory after claiming a slot" and
+terminates: no hole can exist in a running process. `test_alloc_failure` runs each allocation site
+in a forked child and expects `PPPT` on a fresh leaf (outer chunk, child leaf, value box: no_memory
+with nothing stored and `first_valid` advancing; leaf chunk: terminated with that message) and
+`PTT` on a full leaf chunk; it fails if a post-claim failure is let through. In the model a
+post-claim failure has no successor (the process ends), and the abort-after-claim mutant still
+reaches HOLE (`results-failfast.txt`).
+
+A/B against the fetch-add build (d234d24), 5 interleaved rounds under a strict hold;
+`.scratch/logs/ab-ff.log`, summary `ab-ff-summary.md`:
+
+| Keys | Threads | fix Mops | ff Mops | Δ | fix p99 ns | ff p99 ns | Δ p99 |
+|---|---|---|---|---|---|---|---|
+| spread | 1 | 1.10 [1.07-1.11] | 1.11 [1.08-1.13] | +1.2% | 1506 [1473-1526] | 1496 [1460-1581] | -0.7% |
+| spread | 2 | 1.52 [1.49-1.53] | 1.54 [1.51-1.55] | +1.5% | 2113 [2096-2149] | 2100 [2050-2165] | -0.6% |
+| spread | 4 | 2.10 [2.07-2.12] | 2.12 [2.08-2.13] | +0.9% | 3024 [3012-3118] | 3019 [2981-3055] | -0.2% |
+| spread | 8 | 2.88 [2.78-2.90] | 2.90 [2.85-2.93] | +0.5% | 4431 [4412-4455] | 4396 [4360-4438] | -0.8% |
+| spread | 14 | 4.01 [3.98-4.08] | 4.09 [3.87-4.13] | +2.0% | 6469 [6357-6589] | 6558 [6450-6600] | +1.4% |
+| convergent | 1 | 2.07 [1.97-2.09] | 2.08 [2.08-2.11] | +0.8% | 664 [662-707] | 649 [647-656] | -2.3% |
+| convergent | 2 | 2.43 [2.41-2.45] | 2.44 [2.43-2.45] | +0.4% | 1402 [1373-1432] | 1411 [1392-1421] | +0.6% |
+| convergent | 4 | 4.21 [4.16-4.28] | 4.25 [4.23-4.36] | +0.9% | 2008 [1650-2121] | 1765 [1661-1917] | -12.1% |
+| convergent | 8 | 5.87 [5.83-5.90] | 5.93 [5.89-5.95] | +1.0% | 2397 [2371-2458] | 2383 [2371-2485] | -0.6% |
+| convergent | 14 | 7.69 [7.52-7.73] | 7.66 [7.60-7.71] | -0.3% | 3173 [3095-3229] | 3238 [3157-3274] | +2.0% |
+
+| Threads | Build | adds/s | p50 ns | p99 ns | p999 ns | overflows (sum) | far (sum) | adds (sum) | walks (sum) | held by overflow / far pin (sum) | lost |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | fix | 1310524 [1305863-1311827] | 1129 | 10075 [7048-18273] | 27846 [26320-34124] | 0 | 8728022 | 13098968 | 44415 | 0 / 0 | 0 |
+| 256 | ff | 1311394 [1308642-1311611] | 1118 | 8874 [7570-10652] | 28287 [26548-30479] | 0 | 8727939 | 13107128 | 45411 | 0 / 0 | 0 |
+| 1024 | fix | 3489519 [3429351-3519202] | 2730 | 7103 [6976-7429] | 35178 [34809-42877] | 0 | 34539896 | 34849884 | 920 | 0 / 4 | 0 |
+| 1024 | ff | 3514834 [3493402-3529384] | 2744 | 7056 [6914-7242] | 33177 [31437-39559] | 0 | 34819767 | 35131676 | 912 | 0 / 5 | 0 |
+
+Every cell is within the spread (throughput -0.3% to +2.0%); convergent keys are back to the
+fetch-add numbers.
+
 ## Not built: per-slot writer counters
 
 The first idea in this round counted writers on the slots being descended into, instead of the

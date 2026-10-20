@@ -16,17 +16,23 @@
 #include <cassert>
 #include <cstdio>
 #include <limits>
+#include <csignal>
 #include <memory>
 #include <new>
+#include <string>
+#include <utility>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 // The stats hooks, counted here to check where they fire.
 static unsigned long long g_overflows = 0, g_held_overflow = 0, g_held_far = 0;
 #define STASH_ANNOUNCE_STAT(probes, overflowed) (g_overflows += (overflowed))
 #define STASH_HELD_STAT(overflow, far_pin) (g_held_overflow += (overflow), g_held_far += (far_pin))
-// Fails the g_fail_at-th allocation (counting from 1) with std::bad_alloc; 0 = off.
-static int g_fail_at = 0;
-#define STASH_ALLOC_HOOK() (g_fail_at && --g_fail_at == 0 ? throw std::bad_alloc() : (void)0)
+// Counts allocations, and fails the g_fail_at-th (from 1) with std::bad_alloc.
+static int g_fail_at = 0, g_allocs = 0;
+#define STASH_ALLOC_HOOK() (++g_allocs, g_fail_at && --g_fail_at == 0 ? throw std::bad_alloc() : (void)0)
 #include "stash.h"
 
 // The smoke test types: a single keyed level (Div=1, Mod=8) over a leaf.
@@ -165,9 +171,9 @@ static void test_high_key_span_guard() {
 
 		// high_base itself is trivially within the horizon: with a wrapped
 		// horizon the guard would reject this valid key.
-		bool added = wheel.add(ctx, high_base, std::make_shared<int>(7));
-		assert(added && "valid high key wrongly rejected (span guard wrapped)");
-		(void)added;
+		auto result = wheel.add(ctx, high_base, std::make_shared<int>(7));
+		assert(result == stash_result::placed && "valid high key wrongly rejected (span guard wrapped)");
+		(void)result;
 	}
 
 	// Case B: a key just one unit past first_valid_key, still well within a
@@ -176,9 +182,9 @@ static void test_high_key_span_guard() {
 		Wheel wheel;
 		StashContext ctx(high_base);
 
-		bool added = wheel.add(ctx, high_base + 1, std::make_shared<int>(8));
-		assert(added && "valid high key (fvk+1) wrongly rejected (span guard wrapped)");
-		(void)added;
+		auto result = wheel.add(ctx, high_base + 1, std::make_shared<int>(8));
+		assert(result == stash_result::placed && "valid high key (fvk+1) wrongly rejected (span guard wrapped)");
+		(void)result;
 	}
 
 	// Case C: from a low first_valid_key, a key genuinely beyond the horizon
@@ -190,8 +196,8 @@ static void test_high_key_span_guard() {
 		StashContext ctx(0ULL);
 
 		auto value = std::make_shared<int>(9);
-		bool added = wheel.add(ctx, span, value);  // key == horizon.
-		assert(!added && "key at/beyond horizon should be rejected");
+		auto result = wheel.add(ctx, span, value);  // key == horizon.
+		assert(result == stash_result::past_horizon && "key at/beyond horizon should be rejected");
 		assert(value.use_count() == 1 && "a rejected add kept a copy of the value");
 		assert(ctx.atom_last_valid_key.load() == 0 && "a rejected add published a bound");
 		for (auto& a : ctx.announce) {
@@ -203,7 +209,7 @@ static void test_high_key_span_guard() {
 		ctx.end_key = 0;
 		Item item;
 		assert(!wheel.next(ctx, &item) && "a rejected add stored a value");
-		(void)added;
+		(void)result;
 	}
 
 	std::printf("stash OK: high-key span guard rejects beyond-horizon without wrapping\n");
@@ -351,48 +357,77 @@ static void test_descent_window() {
 	std::printf("stash OK: in-flight inserts pin first_valid; late inserts still fire\n");
 }
 
-// An add that fails to allocate (any site: a node, a chunk, a child level, the
-// value box) stores nothing and leaves no reserved hole: the walk still drains
-// and advances first_valid past the key, and a later add one span out is not
-// refused. Both a fresh leaf and a full leaf chunk (the add grows the chain).
-static void test_alloc_failure() {
-	for (int prefill : {0, 4}) {
-		for (int fail_at = 1;; ++fail_at) {
-			Wheel wheel;
-			StashContext ctx(0ULL);
-			std::vector<int> got;
-			for (int i = 0; i < prefill; ++i) {
-				wheel.add(ctx, 3, std::make_shared<int>(30 + i));
-			}
-			auto value = std::make_shared<int>(99);
-			bool threw = false;
-			g_fail_at = fail_at;
-			try {
-				wheel.add(ctx, 3, value);
-			} catch (const std::bad_alloc&) {
-				threw = true;
-			}
-			g_fail_at = 0;
-			if (!threw) {
-				assert(fail_at > 1 && "the add allocated nothing");
-				break;
-			}
-			assert(value.use_count() == 1 && "a failed add kept the value");
-			for (auto& a : ctx.announce) {
-				assert(a.key.load() == StashContext::IDLE && "a failed add left its announce");
-			}
-			drain(wheel, ctx, 8, got);
-			assert(static_cast<int>(got.size()) == prefill && "a failed add lost or stored a value");
-			assert(ctx.atom_first_valid_key.load() > 3 && "a failed add left a hole pinning first_valid");
-			drain(wheel, ctx, 9, got);
-			bool added = wheel.add(ctx, 3 + 8 + 4, std::make_shared<int>(7));
-			assert(added && "first_valid stuck: an add one span out was refused");
-			drain(wheel, ctx, 16, got);
-			assert(got.size() == static_cast<size_t>(prefill) + 1 && got.back() == 7);
-			(void)added;
+// Allocation failure in add. Before the leaf claim (the levels above it, the
+// value box) add returns no_memory, stores nothing, releases its announce, and
+// the walk still advances first_valid past the key; after the claim (the leaf's
+// chunk or a new chain node) it terminates rather than leave a permanent hole.
+// Each site runs in a forked child: P (no_memory, checks pass) or T (terminated
+// with stash's message). A fresh leaf and a full leaf chunk (the add grows the
+// chain) give the expected order of sites.
+static char alloc_failure_site(int prefill, int fail_at) {
+	int err[2];
+	if (pipe(err) != 0) return '?';
+	std::fflush(nullptr);
+	pid_t pid = fork();
+	if (pid == 0) {
+		dup2(err[1], 2);
+		close(err[0]);
+		Wheel wheel;
+		StashContext ctx(0ULL);
+		std::vector<int> got;
+		for (int i = 0; i < prefill; ++i) {
+			wheel.add(ctx, 3, std::make_shared<int>(30 + i));
 		}
+		auto value = std::make_shared<int>(99);
+		g_fail_at = fail_at;
+		auto result = wheel.add(ctx, 3, value);
+		g_fail_at = 0;
+		bool ok = result == stash_result::no_memory && value.use_count() == 1;
+		for (auto& a : ctx.announce) {
+			ok = ok && a.key.load() == StashContext::IDLE && a.far[0].load() == 0 && a.far[1].load() == 0;
+		}
+		drain(wheel, ctx, 8, got);
+		ok = ok && static_cast<int>(got.size()) == prefill && ctx.atom_first_valid_key.load() > 3;
+		drain(wheel, ctx, 9, got);
+		ok = ok && wheel.add(ctx, 3 + 8 + 4, std::make_shared<int>(7)) == stash_result::placed;
+		drain(wheel, ctx, 16, got);
+		ok = ok && got.size() == static_cast<size_t>(prefill) + 1 && got.back() == 7;
+		_exit(ok ? 0 : 3);
 	}
-	std::printf("stash OK: a failed allocation in add leaves no hole; first_valid advances\n");
+	close(err[1]);
+	std::string message;
+	char buf[256];
+	for (ssize_t n; (n = read(err[0], buf, sizeof buf)) > 0;) message.append(buf, static_cast<size_t>(n));
+	close(err[0]);
+	int status = 0;
+	waitpid(pid, &status, 0);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 'P';
+	if (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT &&
+	    message.find("stash: out of memory after claiming a slot") != std::string::npos) return 'T';
+	return '?';
+}
+
+static void test_alloc_failure() {
+	static_assert(noexcept(std::declval<Wheel&>().add(std::declval<StashContext&>(), 0ULL, Item{})));
+	// fresh leaf: outer chunk, child leaf, value box | leaf chunk
+	// full leaf chunk: value box | chain node, chunk
+	for (auto [prefill, expected] : {std::pair<int, std::string>{0, "PPPT"}, {4, "PTT"}}) {
+		Wheel wheel;
+		StashContext ctx(0ULL);
+		for (int i = 0; i < prefill; ++i) {
+			wheel.add(ctx, 3, std::make_shared<int>(30 + i));
+		}
+		g_allocs = 0;
+		auto result = wheel.add(ctx, 3, std::make_shared<int>(99));
+		assert(result == stash_result::placed && g_allocs == static_cast<int>(expected.size()) && "allocation sites changed");
+		std::string sites;
+		for (int fail_at = 1; fail_at <= g_allocs; ++fail_at) {
+			sites += alloc_failure_site(prefill, fail_at);
+		}
+		assert(sites == expected && "a failed allocation left a hole or did not terminate after the claim");
+		(void)result;
+	}
+	std::printf("stash OK: no_memory before the leaf claim stores nothing; after it, terminate\n");
 }
 
 int main() {

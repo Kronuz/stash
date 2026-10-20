@@ -26,8 +26,11 @@
 #include <atomic>                // for std::atomic
 #include <cassert>               // for assert
 #include <cstdint>               // for uintptr_t
+#include <cstdio>                // for std::fputs
+#include <exception>             // for std::terminate
 #include <limits>                // for std::numeric_limits
 #include <memory>                // for std::unique_ptr / std::make_unique
+#include <new>                   // for std::bad_alloc
 #include <type_traits>           // for std::void_t, std::is_nothrow_*
 #include <utility>               // for std::declval, std::forward
 
@@ -92,6 +95,22 @@ inline T* stash_reserved() noexcept {
 #ifndef STASH_HELD_STAT
 #define STASH_HELD_STAT(overflow, far_pin)
 #endif
+
+
+// What add() did with a value: only `placed` stores it.
+enum class stash_result : std::uint8_t {
+	placed,         // filed under its key; the walk will find it
+	past_horizon,   // more than one wheel span (less horizon_margin) ahead
+	no_memory,      // an allocation before the leaf claim failed; nothing stored
+};
+
+
+// A leaf slot was claimed but its chunk could not be allocated. Unfilled, the
+// slot would pin first_valid for good, so the process stops instead.
+[[noreturn]] inline void stash_out_of_memory_after_claim() noexcept {
+	std::fputs("stash: out of memory after claiming a slot\n", stderr);
+	std::terminate();
+}
 
 
 // Each thread's preferred announce slot; it moves to wherever the thread last
@@ -771,10 +790,11 @@ public:
 		ptr->put(ctx, key, std::forward<Args>(args)...);
 	}
 
-	// False, storing nothing, when the key is past the horizon; true once placed.
-	// Allocation failure (std::bad_alloc) propagates.
+	// placed, or why not, storing nothing: past_horizon, or no_memory when an
+	// allocation before the leaf claim fails. A failure after the claim
+	// terminates (stash_out_of_memory_after_claim): it would leave a hole.
 	template<typename... Args>
-	bool add(StashContext& ctx, unsigned long long key, Args&&... args) {
+	stash_result add(StashContext& ctx, unsigned long long key, Args&&... args) noexcept {
 		// Announce before touching the tree; a key already below the insert floor
 		// (overdue past the last walk's end) is filed at the floor instead.
 		StashContext::InFlight in_flight(ctx, key);
@@ -788,12 +808,18 @@ public:
 			horizon -= ctx.horizon_margin;
 		}
 		if (key >= horizon) {
-			return false;
+			return stash_result::past_horizon;
 		}
 
 		L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load());
-		put(ctx, key, std::forward<Args>(args)...);
-		return true;
+		try {
+			put(ctx, key, std::forward<Args>(args)...);
+		} catch (const std::bad_alloc&) {
+			// Only before the leaf claim: the levels above it or the value box. The
+			// partial path stays (empty nodes), and InFlight retracts the announce.
+			return stash_result::no_memory;
+		}
+		return stash_result::placed;
 	}
 };
 
@@ -945,30 +971,24 @@ public:
 
 	template<typename... Args>
 	void put(StashContext& ctx, unsigned long long key, Args&&... args) {
-		// Everything that can throw (the value box and its constructor, the leaf's
-		// nodes and chunks) happens before the reserve: a reserved slot that is
-		// never filled is a hole the walk parks on for good, pinning first_valid.
+		// The value box (and the value's constructor) comes before the claim, so a
+		// std::bad_alloc there claims nothing and add() returns no_memory.
 		STASH_ALLOC_HOOK();
 		auto value = std::make_unique<_Tp>(std::forward<Args>(args)...);
 
-		// RESERVE: claim the next slot only once its chunk exists, so a failure
-		// reserves nothing. The path to this leaf was already built during descent,
-		// so the consumer can reach it the instant the bound below is published.
-		// relaxed: the slot index is private, and the claim is made visible to the
-		// consumer's pending check by the bound's release-store below.
-		// A retry stays in the chunk (a pointer bump) or resumes the chain walk from
-		// the node it reached (the cursor), so the load-to-CAS window stays short.
-		typename Stash_T::Cursor cursor;
+		// RESERVE: claim a slot and ensure its physical location exists. The path
+		// to this leaf was already built during descent, so the consumer can reach
+		// it the instant the bound below is published. relaxed: the slot index is
+		// private, and this increment is made visible to the consumer's pending
+		// check by the bound's release-store below (sequenced after it).
+		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
 		std::atomic<_Tp*>* ptr_atom_ptr;
-		auto slot = atom_end.load(std::memory_order_relaxed);
-		Stash_T::get(&ptr_atom_ptr, slot, true, cursor);
-		for (auto got = slot; !atom_end.compare_exchange_weak(slot, slot + 1,
-		         std::memory_order_relaxed, std::memory_order_relaxed); got = slot) {
-			if (slot / _Size == got / _Size) {
-				ptr_atom_ptr += slot - got;   // same chunk: no walk, no allocation
-			} else {
-				Stash_T::get(&ptr_atom_ptr, slot, true, cursor);
-			}
+		try {
+			Stash_T::get(&ptr_atom_ptr, slot, true);
+		} catch (...) {
+			// A new chunk or chain node failed after the claim: an unfilled claimed
+			// slot is a permanent hole, so fail fast rather than run with one.
+			stash_out_of_memory_after_claim();
 		}
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}slot:{}, atom_end:{}, op:{}", ctx._col(), slot, atom_end.load(), ctx._op());
 

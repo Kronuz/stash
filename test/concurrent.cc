@@ -157,10 +157,10 @@ int main(int argc, char** argv) {
 			uint64_t id = uid_gen.fetch_add(1, std::memory_order_relaxed);
 			auto t = std::make_shared<Task>(id);
 			unsigned long long key = now_ns() + lead + jitter(rng);
-			if (wheel->add(ctx, key, t)) {
+			if (wheel->add(ctx, key, t) == stash_result::placed) {
 				added_count.fetch_add(1, std::memory_order_relaxed);
 				added_xor.fetch_xor(id, std::memory_order_relaxed);
-			}   // else beyond the horizon: not inserted, not accounted
+			}   // else past the horizon (or no memory): not inserted, not accounted
 			if (pause_ns) { auto u = now_ns() + pause_ns; while (now_ns() < u) {} }
 		}
 	};

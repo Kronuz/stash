@@ -131,15 +131,15 @@ int main() {
 	rule("add() rejects a key beyond one wheel span (the wrap horizon)");
 	// The wheel reuses each physical slot every SPAN keys. A key a full span or
 	// more past first_valid would alias a slot still in use, so add() returns
-	// false instead of silently colliding. Here first_valid has advanced to 64 from the
+	// stash_result::past_horizon instead of silently colliding. Here first_valid has advanced to 64 from the
 	// drain above, so the horizon sits at 64 + 64 = 128.
 	{
 		unsigned long long fvk = ctx.atom_first_valid_key.load();
 		unsigned long long beyond = fvk + SPAN;     // exactly one span out: at the horizon
-		if (wheel.add(ctx, beyond, std::make_shared<int>(999))) {
+		if (wheel.add(ctx, beyond, std::make_shared<int>(999)) == stash_result::placed) {
 			std::printf("  add key=%llu unexpectedly accepted\n", beyond);
 		} else {
-			std::printf("  add key=%llu rejected (add returned false): first_valid=%llu, span=%llu, horizon=%llu\n",
+			std::printf("  add key=%llu rejected (past_horizon): first_valid=%llu, span=%llu, horizon=%llu\n",
 			            beyond, fvk, SPAN, fvk + SPAN);
 		}
 	}

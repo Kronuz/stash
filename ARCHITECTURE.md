@@ -124,10 +124,11 @@ allocation on a lost race. Then it forwards `put` to the child. The recursion bo
 `add(ctx, key, args...)` is `put` with an announce and bounds checking. It first
 announces the insert (see "Inserts in flight" below), which may raise a key that is
 already overdue to the insert floor. It then checks
-`key >= get_end_base_key(ctx.atom_first_valid_key.load())` and throws
-`std::out_of_range("stash overflow")` if the key is more than one wheel span
-past the first valid key. The leaf raises `atom_last_valid_key` toward `key`
-before filling the slot; that bound is what lets the walk skip empty key ranges.
+`key >= get_end_base_key(ctx.atom_first_valid_key.load())` and returns false,
+storing nothing, if the key is more than one wheel span past the first valid key;
+otherwise it places the value and returns true. Only allocation failure throws.
+The leaf raises `atom_last_valid_key` toward `key` before filling the slot; that
+bound is what lets the walk skip empty key ranges.
 Producers never write `atom_first_valid_key`; only the walk does.
 
 ## The leaf: `StashValues`
@@ -334,6 +335,43 @@ starved. `bench/bench_bursty.cc` measures the hint-miss and overflow rates
 directly. Per-thread slots would not scale to that workload: thousands of
 threads would exhaust any table a walk can afford to scan.
 
+**The window.** Only a key the walk can reach before its next refresh needs a slot,
+and most inserts are far ahead of it (deferred logging and debouncers file keys
+100 ms to 3 s out). The walk publishes `atom_window`, the floor plus
+`WINDOW_CHUNK * WINDOW_WIDE` finest slots (64 ms on Xapiand's wheel), and moves it
+at a refresh once the floor is within a chunk (4 ms) of it. Each move opens an
+epoch named by the window's low bit: a new window is always above the old one and
+of the other parity. An `add` whose key is at or past the window skips the board.
+It adds one (seq_cst) to its epoch's count on its remembered announce line,
+re-reads the window, and retries against the new one if it moved; the destructor
+subtracts the one. The refresh sums the previous epoch's count over the 64 lines
+it already reads, then:
+
+- a far insert of the current epoch has a key at or past `window`, and the walk
+  caps `first_valid` there;
+- one of the previous epoch has a key at or past `prev_window`. While that count
+  is nonzero (`far_pinned`) the walk caps at `prev_window` and does not move the
+  window again, since the next epoch would reuse the parity.
+
+The recheck is the store-load pair: either the walk's count read sees the
+increment, or the producer's re-read sees the new window. The width is fixed. A
+stalled far producer holds `first_valid` at the window it read and the window
+where it is; walks keep firing above it. On `bench_bursty` at 1,024 threads 99%
+of inserts take this path and the board holds a handful of keys
+([docs/perf/window-epoch.md](docs/perf/window-epoch.md)).
+
+**Observing overflow.** The library neither logs nor keeps production counters:
+overflow and both holds are proven safe, so they are trial statistics, reported
+through compile-time hooks that are no-ops unless a build defines them before
+including `stash.h`. `STASH_ANNOUNCE_STAT(probes, overflowed)` fires per board
+claim (`overflowed` when the insert took the overflow counter),
+`STASH_FAR_STAT()` per far insert, and `STASH_HELD_STAT(overflow, far_pin)` per
+walk start whose scan capped `first_valid` lower, by cause. `bench/bench_bursty.cc`
+defines all three. A hold re-reads the board on every call that starts at
+`first_valid`, so under a consumer that starts every call there (scheduler's
+`walk()`) one long hold reports once per call: the count measures time held more
+than the number of holds.
+
 The visible change is for keys already overdue: a key below the floor (the last
 walk's end) is filed at the floor instead of lowering `first_valid` to it. It
 still fires on the next walk, as before; only its order among other overdue tasks
@@ -494,7 +532,7 @@ latencies.
   that leaf, until it resumes; one preempted anywhere in `add` holds
   `first_valid`. The values are re-drained on the next pass, never lost, but
   `clean` frees nothing above the pin and each walk re-walks the pinned range. A
-  stall longer than one span (less `horizon_margin`) makes every `add` throw,
+  stall longer than one span (less `horizon_margin`) makes every `add` return false,
   overdue keys included, because the floor they are filed at is past the horizon.
 - **Every walk starts at `first_valid`.** A consumer that carries `begin_key` over
   from its previous walk never refreshes the in-flight snapshot, so `first_valid`
@@ -506,10 +544,14 @@ latencies.
   deletes every value pointer in the chunk, then the chunk. It swallows
   exceptions through `L_EXC`. Destruction is not concurrency-safe and assumes no walker
   or producer is active.
-- **Overflow is a hard error.** `add` throws `std::out_of_range` when a key is
-  more than one wheel span (less `horizon_margin`) past `atom_first_valid_key`.
-  The caller (a scheduler) keeps keys within the live window by draining the
-  wheel as the clock advances.
+- **Overflow is refused, not stored.** `add` returns false when a key is more
+  than one wheel span (less `horizon_margin`) past `atom_first_valid_key`. The
+  caller (a scheduler) keeps keys within the live window by draining the wheel as
+  the clock advances, and must check the result to know a value was refused.
+- **The walk does not throw.** `next` (walk, peep, clean) allocates nothing and is
+  `noexcept` when the value type's copy-assignment, bool tests and destructor are
+  (a `shared_ptr` value is). An injected trace header that throws from `L_STASH`
+  or `L_DEBUG_HOOK` inside it would terminate.
 
 ## Possible improvements
 

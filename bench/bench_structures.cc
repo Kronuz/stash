@@ -76,7 +76,7 @@ struct StashWheel {
 
 	static constexpr bool is_scheduler = true;
 	void add(int /*tid*/, unsigned long long key, const TaskPtr& t) {
-		try { queue.add(ctx, key, t); } catch (const std::out_of_range&) {}
+		queue.add(ctx, key, t);
 	}
 	uint64_t walk() {
 		ctx.op = StashContext::Operation::walk;

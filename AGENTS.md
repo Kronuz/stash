@@ -49,6 +49,10 @@ To redraw the README diagram:
 ## Conventions
 
 - **C++17, header-only.** Nothing that needs a `.cc` or a link step.
+- **`noexcept` where it holds.** `next` (walk, peep, clean) never allocates and
+  is `noexcept` whenever the value type's copy, bool tests and destruction are
+  (`StashValues::nothrow_next`); keep anything that can throw off that path.
+  Only `add`/`put` allocate.
 - **Lock-free atomics.** Shared mutation goes through `std::atomic` with
   `compare_exchange`, `exchange`, or fetch-add. No mutexes or blocking.
 - **No dependencies.** `stash.h` includes only standard headers and the trace
@@ -92,10 +96,13 @@ Breaking one of these produces silent loss or a race, not a compile error.
   the tree; a later call's snapshot would not cover ranges the walk already
   passed. That store-load pair keeps `first_valid` at or below every insert in
   flight; weakening either side to acquire/release reopens the descent window.
-  `first_valid <= atom_insert_floor` always.
+  `first_valid <= atom_insert_floor` always. A key at or past `atom_window`
+  takes the far path instead: it counts itself in its window epoch (seq_cst)
+  and re-reads the window; the walk caps at `window`, at `prev_window` while
+  that epoch's count is nonzero, and moves the window only once it drains.
 - **Every walk starts at `begin_key = atom_first_valid_key`.** The snapshot is
   refreshed only on such a call; a consumer that carries `begin_key` over from its
-  previous walk freezes `first_valid` (no `clean`, and `add` throws past one span).
+  previous walk freezes `first_valid` (no `clean`, and `add` returns false past one span).
   Continuing a walk with further `next` calls is fine.
 - **Pointer-like, non-null values.** The walk's liveness test is `*ptr && **ptr`;
   a null or "zero" value reads as absent.
@@ -106,8 +113,8 @@ Read this before proposing stash for a new timer or deadline use. The README has
 
 - **The shape it is best at.** Many producer threads `add` deadline-tagged items, one thread walks what is due, and most items fire instead of being cancelled. Deferred logging and per-key debouncing are that shape.
 - **Resolution.** The finest `_Div` (1 ms on Xapiand's stack). The walk drains a finest slot whole, so an item can fire up to one slot early, and items in a slot fire in arrival order.
-- **Horizon.** The outermost `_Div * _Mod` from the slot of `first_valid` (24 h on Xapiand's stack). `add` throws past it; scheduler's `add` catches and drops. A stalled producer or a walker that has not walked holds `first_valid` back, and the horizon with it.
-- **Single walker.** `walk`, `peep`, and `clean` on one thread; `add` from any number. Beyond `ANNOUNCE_SLOTS` (64) inserts in flight, the overflow counter holds `first_valid` still until they finish.
+- **Horizon.** The outermost `_Div * _Mod` from the slot of `first_valid` (24 h on Xapiand's stack). `add` returns false past it and stores nothing; scheduler's `add` returns that false to its caller. A stalled producer or a walker that has not walked holds `first_valid` back, and the horizon with it.
+- **Single walker.** `walk`, `peep`, and `clean` on one thread; `add` from any number. Beyond `ANNOUNCE_SLOTS` (64) inserts in flight below the window, the overflow counter holds `first_valid` still until they finish; the `STASH_ANNOUNCE_STAT` and `STASH_HELD_STAT` hooks report how often in a trial build.
 - **Cancel is the caller's.** There is no remove. The value is flagged dead (scheduler's `clear()`), the entry and the object it points to stay until the walk drains their slot (up to the whole remaining delay), and `peep` rescans dead entries ahead of the first live one. A later deadline is cancel plus a new `add`. Churn that slides deadlines forward (idle timeouts, election timers) accumulates about rate times delay in dead entries; use a lazy re-arm (store the new deadline, let the one pending timer re-add itself when it fires early) instead of cancel and add.
 - **Memory.** About 4.3 KB per `StashContext` by layout (the announce array; scheduler holds two), a 38 KB top-level chunk on first insert (Xapiand's stack), about 160 B per distinct finest slot in use, and per pending item an 8 B slot plus a heap-allocated value (16 B for a `shared_ptr`). One wheel per walker, not per object: a wheel per index costs about 47 KB on Xapiand's stack (two contexts and the top chunk), so 10,000 indexes hold about 470 MB before any timer is armed. Values that keep an object alive (`shared_ptr`) pin it until the slot drains; use a `weak_ptr` payload where the object can close earlier.
 - **Candidates that fit.** strata's per-index refresh and flush deadlines (shared host wheel, injected clock, re-arm on fire so idle indexes hold no timer); time-windowed retention drops (needs the extra level below); Xapiand's debouncers (already on it; they want the lazy re-arm in scheduler).
@@ -134,16 +141,16 @@ Read this before proposing stash for a new timer or deadline use. The README has
 - **`clean` is required.** Without it the structure grows without bound.
 - **Size the span above one clean pass.** A wheel the consumer laps aliases a live
   subtree while `clean` frees it.
-- **Overflow throws.** `add` throws `std::out_of_range("stash overflow")` past one
-  span (less `horizon_margin`) from `atom_first_valid_key`; the scheduler drains
-  as its clock advances.
+- **A past-horizon `add` returns false.** Past one span (less `horizon_margin`)
+  from `atom_first_valid_key` it stores nothing and returns false; ignoring the
+  result drops the value. Only allocation failure throws (`std::bad_alloc`).
 - **Insert through `add`, not `put`.** `put` skips the announce, so a `put`
   racing the walk can be skipped or freed under; `add` is the concurrent entry
   point.
 - **A stalled producer pins `first_valid`.** Its announce holds the low-water mark
   (and so `clean` and the horizon) until it resumes; walks keep firing above it,
   each re-walking the pinned range. A stall longer than one wheel span (less
-  `horizon_margin`) makes every `add` throw, overdue keys included, since they are
+  `horizon_margin`) makes every `add` return false, overdue keys included, since they are
   filed at the floor; the scheduler drops those tasks. `add` never blocks, so only
   preemption, `malloc` or a page fault can hold it: impossible in practice on the
   scheduler's 24 h wheel, 4 s on `test/concurrent.cc`'s.

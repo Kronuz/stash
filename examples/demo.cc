@@ -130,17 +130,16 @@ int main() {
 	// --- 5. the horizon guard: keys past one span are rejected ---------------
 	rule("add() rejects a key beyond one wheel span (the wrap horizon)");
 	// The wheel reuses each physical slot every SPAN keys. A key a full span or
-	// more past first_valid would alias a slot still in use, so add() throws
-	// instead of silently colliding. Here first_valid has advanced to 64 from the
+	// more past first_valid would alias a slot still in use, so add() returns
+	// false instead of silently colliding. Here first_valid has advanced to 64 from the
 	// drain above, so the horizon sits at 64 + 64 = 128.
 	{
 		unsigned long long fvk = ctx.atom_first_valid_key.load();
 		unsigned long long beyond = fvk + SPAN;     // exactly one span out: at the horizon
-		try {
-			wheel.add(ctx, beyond, std::make_shared<int>(999));
+		if (wheel.add(ctx, beyond, std::make_shared<int>(999))) {
 			std::printf("  add key=%llu unexpectedly accepted\n", beyond);
-		} catch (const std::out_of_range&) {
-			std::printf("  add key=%llu rejected (out_of_range): first_valid=%llu, span=%llu, horizon=%llu\n",
+		} else {
+			std::printf("  add key=%llu rejected (add returned false): first_valid=%llu, span=%llu, horizon=%llu\n",
 			            beyond, fvk, SPAN, fvk + SPAN);
 		}
 	}

@@ -54,7 +54,7 @@ struct StashWheel {
 	Wheel queue;
 	StashWheel() : ctx(now_ns()) {}
 	void arm(int, unsigned long long key, const TaskPtr& t) {
-		try { queue.add(ctx, key, t); } catch (const std::out_of_range&) {}
+		queue.add(ctx, key, t);
 	}
 	void walk() {
 		ctx.op = StashContext::Operation::walk;

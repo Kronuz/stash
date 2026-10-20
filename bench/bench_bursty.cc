@@ -5,7 +5,9 @@
 // instant. One consumer walks and cleans as SchedulerQueue does. Reports insert
 // throughput, add() latency percentiles, how often the announce claim missed its
 // hinted slot or fell back to the overflow counter, how many took the far path
-// (keys past the window; 0 on builds without it), and lost tasks (must be 0).
+// (keys past the window; 0 on builds without it), the consumer's walks and how
+// many of them the overflow counter or a far pin held back (n/a on builds without
+// the hook), and lost tasks (must be 0).
 //
 //   bench_bursty [SECONDS] [BURST] [SLEEP_MIN_US] [SLEEP_MAX_US] THREADS...
 //   bench_bursty 2 8 500 2000 256 1024
@@ -19,6 +21,8 @@
 #include <memory>
 #include <random>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 // Count the announce claim outcomes per thread (a no-op on builds without it).
@@ -31,9 +35,19 @@ static thread_local AnnounceStats t_stats;
 
 #define STASH_FAR_STAT() (++t_stats.far)
 
+// Walk starts held back, by cause; only the consumer thread writes them.
+static uint64_t g_held_overflow = 0, g_held_far = 0;
+#define STASH_HELD_STAT(o, f) (g_held_overflow += (o), g_held_far += (f))
+
 #include "stash.h"
 
 static constexpr unsigned long long MS = 1000000ULL;
+
+// Whether this stash.h has the window (and so calls STASH_HELD_STAT).
+template <typename C, typename = void>
+struct HasWindow : std::false_type {};
+template <typename C>
+struct HasWindow<C, std::void_t<decltype(C::WINDOW_CHUNK)>> : std::true_type {};
 
 static inline unsigned long long now_ns() {
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -59,6 +73,7 @@ struct Result {
 	uint64_t added, lost;
 	double p50, p99, p999;
 	AnnounceStats stats;
+	uint64_t walks, held_overflow, held_far;
 };
 
 static Result run(int nthreads, double seconds, int burst, unsigned sleep_min_us, unsigned sleep_max_us) {
@@ -72,10 +87,12 @@ static Result run(int nthreads, double seconds, int burst, unsigned sleep_min_us
 	std::vector<std::vector<uint32_t>> lat(nthreads);
 	std::vector<AnnounceStats> stats(nthreads);
 
-	uint64_t fired = 0;
+	uint64_t fired = 0, walks = 0;
+	g_held_overflow = g_held_far = 0;
 	std::thread consumer([&] {
 		TaskPtr out;
 		auto walk = [&] {
+			++walks;
 			ctx.op = StashContext::Operation::walk;
 			ctx.pending_floor = StashContext::IDLE;
 			ctx.begin_key = ctx.atom_first_valid_key.load();
@@ -115,12 +132,11 @@ static Result run(int nthreads, double seconds, int burst, unsigned sleep_min_us
 				for (int b = 0; b < burst; ++b) {
 					auto task = std::make_shared<Task>(++id);
 					auto t0 = now_ns();
-					try {
-						wheel->add(ctx, t0 + lead(rng), task);
+					if (wheel->add(ctx, t0 + lead(rng), task)) {
 						auto dt = now_ns() - t0;
 						my.push_back(dt > UINT32_MAX ? UINT32_MAX : (uint32_t)dt);
 						added.fetch_add(1, std::memory_order_relaxed);
-					} catch (const std::out_of_range&) {}
+					}
 				}
 				std::this_thread::sleep_for(std::chrono::microseconds(nap(rng)));
 			}
@@ -153,6 +169,9 @@ static Result run(int nthreads, double seconds, int burst, unsigned sleep_min_us
 	r.p50 = pct(0.50);
 	r.p99 = pct(0.99);
 	r.p999 = pct(0.999);
+	r.walks = walks;
+	r.held_overflow = g_held_overflow;
+	r.held_far = g_held_far;
 	for (auto& s : stats) {
 		r.stats.claims += s.claims;
 		r.stats.misses += s.misses;
@@ -174,7 +193,7 @@ int main(int argc, char** argv) {
 
 	printf("bench_bursty: %.1fs, bursts of %d adds, sleep %u-%u us between bursts, keys now+uniform(0,100ms)\n",
 	       seconds, burst, sleep_min, sleep_max);
-	printf("threads |    adds/s |   p50 ns |   p99 ns |  p999 ns | hint miss | probes/miss | overflow |      far | lost\n");
+	printf("threads |    adds/s |   p50 ns |   p99 ns |  p999 ns | hint miss | probes/miss | overflow |      far |   walks | held ovf | held far | lost\n");
 	int failed = 0;
 	for (int n : threads) {
 		auto r = run(n, seconds, burst, sleep_min, sleep_max);
@@ -185,8 +204,14 @@ int main(int argc, char** argv) {
 			snprintf(probes, sizeof probes, "%.2f", s.misses ? (double)s.probes / s.misses : 0.0);
 			snprintf(over, sizeof over, "%llu", (unsigned long long)s.overflows);
 		}
-		printf("%7d | %9.0f | %8.0f | %8.0f | %8.0f | %9s | %11s | %8s | %8llu | %llu\n",
-		       n, r.adds_per_sec, r.p50, r.p99, r.p999, miss, probes, over, (unsigned long long)s.far, (unsigned long long)r.lost);
+		char held_ovf[32] = "n/a", held_far[32] = "n/a";
+		if (HasWindow<StashContext>::value) {
+			snprintf(held_ovf, sizeof held_ovf, "%llu", (unsigned long long)r.held_overflow);
+			snprintf(held_far, sizeof held_far, "%llu", (unsigned long long)r.held_far);
+		}
+		printf("%7d | %9.0f | %8.0f | %8.0f | %8.0f | %9s | %11s | %8s | %8llu | %6llu | %8s | %8s | %llu\n",
+		       n, r.adds_per_sec, r.p50, r.p99, r.p999, miss, probes, over, (unsigned long long)s.far,
+		       (unsigned long long)r.walks, held_ovf, held_far, (unsigned long long)r.lost);
 		failed += r.lost != 0;
 	}
 	return failed ? 1 : 0;

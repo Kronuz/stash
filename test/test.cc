@@ -18,6 +18,11 @@
 #include <limits>
 #include <memory>
 #include <vector>
+
+// The stats hooks, counted here to check where they fire.
+static unsigned long long g_overflows = 0, g_held_overflow = 0, g_held_far = 0;
+#define STASH_ANNOUNCE_STAT(probes, overflowed) (g_overflows += (overflowed))
+#define STASH_HELD_STAT(overflow, far_pin) (g_held_overflow += (overflow), g_held_far += (far_pin))
 #include "stash.h"
 
 // The smoke test types: a single keyed level (Div=1, Mod=8) over a leaf.
@@ -26,6 +31,18 @@ using Leaf  = StashValues<Item, 4>;
 using Wheel = StashSlots<Leaf, 8, /*Div*/1, /*Mod*/8>;
 
 // Original smoke test: insert at small keys, walk in order, consume.
+// walk, peep and clean are noexcept for values whose copy, bool tests and
+// destruction cannot throw (shared_ptr), and not for one whose copy can.
+static_assert(noexcept(std::declval<Wheel&>().next(std::declval<StashContext&>(), std::declval<Item*>())));
+struct ThrowingCopy {
+	int v = 1;
+	ThrowingCopy& operator=(const ThrowingCopy&) noexcept(false) { return *this; }
+	explicit operator bool() const noexcept { return true; }
+	int operator*() const noexcept { return v; }
+};
+static_assert(!noexcept(std::declval<StashSlots<StashValues<ThrowingCopy, 4>, 8, 1, 8>&>().next(
+    std::declval<StashContext&>(), std::declval<ThrowingCopy*>())));
+
 static void test_smoke() {
 	Wheel wheel;
 	StashContext ctx(0ULL);   // op=walk, begin/end/first/last = 0
@@ -124,10 +141,10 @@ static void test_low_key_no_underflow() {
 
 // Bug 2 regression: the span/overflow guard must not wrap for high keys.
 //
-// add() throws when key >= get_end_base_key(first_valid_key), i.e. when the
+// add() returns false when key >= get_end_base_key(first_valid_key), i.e. when the
 // key is more than one wheel span past the first valid key's base. With a key
 // high in the 64-bit range, get_base_key + Div*Mod used to wrap to a small
-// value, so the guard either threw on a clearly-valid key (just past
+// value, so the guard either rejected a clearly-valid key (just past
 // first_valid_key) or accepted a key far beyond the horizon. After the fix the
 // horizon saturates at max instead of wrapping.
 static void test_high_key_span_guard() {
@@ -142,15 +159,11 @@ static void test_high_key_span_guard() {
 		Wheel wheel;
 		StashContext ctx(high_base);  // seeds first/last valid key = high_base.
 
-		bool threw = false;
-		try {
-			// high_base itself is trivially within the horizon: with a wrapped
-			// horizon the guard would reject this valid key.
-			wheel.add(ctx, high_base, std::make_shared<int>(7));
-		} catch (const std::out_of_range&) {
-			threw = true;
-		}
-		assert(!threw && "valid high key wrongly rejected (span guard wrapped)");
+		// high_base itself is trivially within the horizon: with a wrapped
+		// horizon the guard would reject this valid key.
+		bool added = wheel.add(ctx, high_base, std::make_shared<int>(7));
+		assert(added && "valid high key wrongly rejected (span guard wrapped)");
+		(void)added;
 	}
 
 	// Case B: a key just one unit past first_valid_key, still well within a
@@ -159,30 +172,34 @@ static void test_high_key_span_guard() {
 		Wheel wheel;
 		StashContext ctx(high_base);
 
-		bool threw = false;
-		try {
-			wheel.add(ctx, high_base + 1, std::make_shared<int>(8));
-		} catch (const std::out_of_range&) {
-			threw = true;
-		}
-		assert(!threw && "valid high key (fvk+1) wrongly rejected (span guard wrapped)");
+		bool added = wheel.add(ctx, high_base + 1, std::make_shared<int>(8));
+		assert(added && "valid high key (fvk+1) wrongly rejected (span guard wrapped)");
+		(void)added;
 	}
 
 	// Case C: from a low first_valid_key, a key genuinely beyond the horizon
 	// must still be rejected. This confirms the guard didn't get disabled; it
 	// only stops wrapping. With fvk = 0 and span = 8, key 8 is the first key at
-	// or past the horizon and must throw.
+	// or past the horizon: add returns false and stores nothing.
 	{
 		Wheel wheel;
 		StashContext ctx(0ULL);
 
-		bool threw = false;
-		try {
-			wheel.add(ctx, span, std::make_shared<int>(9));  // key == horizon.
-		} catch (const std::out_of_range&) {
-			threw = true;
+		auto value = std::make_shared<int>(9);
+		bool added = wheel.add(ctx, span, value);  // key == horizon.
+		assert(!added && "key at/beyond horizon should be rejected");
+		assert(value.use_count() == 1 && "a rejected add kept a copy of the value");
+		assert(ctx.atom_last_valid_key.load() == 0 && "a rejected add published a bound");
+		for (auto& a : ctx.announce) {
+			assert(a.key.load() == StashContext::IDLE && a.far[0].load() == 0 && a.far[1].load() == 0 &&
+			       "a rejected add left its announce behind");
 		}
-		assert(threw && "key at/beyond horizon should be rejected");
+		ctx.op = StashContext::Operation::peep;
+		ctx.begin_key = 0;
+		ctx.end_key = 0;
+		Item item;
+		assert(!wheel.next(ctx, &item) && "a rejected add stored a value");
+		(void)added;
 	}
 
 	std::printf("stash OK: high-key span guard rejects beyond-horizon without wrapping\n");
@@ -276,13 +293,19 @@ static void test_descent_window() {
 			slots.push_back(std::make_unique<StashContext::InFlight>(ctx, 6));
 		}
 		{
+			g_overflows = g_held_overflow = g_held_far = 0;
 			StashContext::InFlight overflowed(ctx, 3);
 			assert(ctx.atom_announce_overflow.load() == 1);
+			assert(g_overflows == 1 && "overflow not reported");
 			drain(wheel, ctx, 8, got);
 			assert(ctx.atom_first_valid_key.load() == held && "walk passed an overflowed insert");
+			assert(g_held_overflow > 0 && g_held_far == 0 && "overflow hold not reported");
 		}
 		slots.clear();
+		auto held_overflow = g_held_overflow;
 		drain(wheel, ctx, 8, got);
+		drain(wheel, ctx, 9, got);
+		assert(g_overflows == 1 && g_held_overflow == held_overflow && "hold reported with nothing held");
 		assert(ctx.atom_first_valid_key.load() > 3 && "first_valid stuck after the overflow drained");
 		assert(got.empty());
 	}
@@ -298,6 +321,7 @@ static void test_descent_window() {
 		drain(wheel, ctx, 8, got);
 		auto w = ctx.atom_window.load();
 		assert(w > 7 && w < 100);
+		g_held_overflow = g_held_far = 0;
 		auto far_count = [&] {
 			unsigned n = 0;
 			for (auto& a : ctx.announce) n += a.far[0].load() + a.far[1].load();
@@ -308,6 +332,7 @@ static void test_descent_window() {
 		drain(wheel, ctx, 90, got);
 		auto w2 = ctx.atom_window.load();
 		assert(w2 > w && ctx.far_pinned && ctx.atom_first_valid_key.load() <= w);
+		assert(g_held_far > 0 && g_held_overflow == 0 && "far pin hold not reported");
 		drain(wheel, ctx, 200, got);
 		assert(ctx.atom_window.load() == w2 && "window moved over a live epoch");
 		assert(ctx.atom_first_valid_key.load() <= w && "walk passed a stalled far insert");

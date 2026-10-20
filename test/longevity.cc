@@ -80,8 +80,7 @@ static void simulate(bool do_clean) {
 				int k = count(rng);
 				for (int j = 0; j < k; ++j) {
 					unsigned long long key = t + delay(rng);
-					try { wheel->add(ctx, key, std::make_shared<Task>(inserted)); ++inserted; }
-					catch (const std::out_of_range&) {}
+					if (wheel->add(ctx, key, std::make_shared<Task>(inserted))) { ++inserted; }
 				}
 			}
 			ctx.op = StashContext::Operation::walk;

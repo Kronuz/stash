@@ -19,8 +19,19 @@ Carries the state for a single traversal.
   caps its `first_valid` advance there. The consumer resets it to
   `StashContext::IDLE` before each walk.
 - `announce`, `atom_announce_overflow`, `atom_insert_floor`, `insert_floor`,
-  `first_valid_cap`, `depth` — the in-flight handshake between `add` and the walk
+  `first_valid_cap`, `depth`, `atom_window`, `window`, `prev_window`,
+  `far_pinned` — the in-flight handshake between `add` and the walk
   (ARCHITECTURE.md, "Inserts in flight"). Internal; leave them alone.
+
+Statistics hooks, no-ops unless defined before `stash.h` (for benchmarks and
+trials; ARCHITECTURE.md, "Observing overflow"):
+
+- `STASH_ANNOUNCE_STAT(probes, overflowed)` — per board claim: slots tried past
+  the hinted one, and whether the insert fell back to the overflow counter.
+- `STASH_FAR_STAT()` — per insert that took the far path (key at or past the window).
+- `STASH_HELD_STAT(overflow, far_pin)` — per walk start whose board scan capped
+  `first_valid` lower, by cause: the overflow counter, or a far insert of the
+  previous window epoch still in flight.
 - `InFlight(ctx, key)` — RAII announce of one insert; `key()` is the key to file
   under. `add` uses it; a caller of `put` that races a walk needs one too.
 - `check(key, limit_key)` — the loop predicate: stops when `key` reaches
@@ -46,9 +57,10 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
 - `add(ctx, key, args...)` — `put` plus the in-flight announce and bound
   maintenance, safe to call from many threads while one consumer walks. A key
   below `atom_insert_floor` (overdue past the last walk's end) is filed at the
-  floor; it fires on the next walk. Throws `std::out_of_range("stash overflow")`
-  if the key is beyond the wheel span `[first_valid_key, first_valid_key +
-  Div*Mod)`.
+  floor; it fires on the next walk. Returns true once the value is placed, and
+  false, storing nothing, if the key is beyond the wheel span `[first_valid_key,
+  first_valid_key + Div*Mod)` (less `horizon_margin`). Throws only
+  `std::bad_alloc`, from a node, chunk or value allocation.
 - `finest_div` — the finest slot width below this level; the walk refreshes its
   in-flight snapshot at most once per `finest_div` keys.
 - `next(ctx, value_ptr [, limit_key])` — walks the key window in `ctx.op` mode,
@@ -58,7 +70,9 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
   where it stopped. The walk refreshes its in-flight snapshot only on a call that
   starts at `first_valid`, so a consumer that carries `begin_key` over from its
   previous walk never refreshes: `first_valid` stops advancing, `clean` frees
-  nothing, and `add` throws once keys pass one span.
+  nothing, and `add` returns false once keys pass one span. `noexcept` whenever
+  the leaf's value operations are (`StashValues::nothrow_next<T>`: copy-assign,
+  bool tests, destructor); it never allocates.
 
 ## `StashValues<T, Size>`
 

@@ -28,8 +28,8 @@
 #include <cstdint>               // for uintptr_t
 #include <limits>                // for std::numeric_limits
 #include <memory>                // for std::unique_ptr / std::make_unique
-#include <stdexcept>             // for std::out_of_range
-#include <type_traits>           // for std::void_t
+#include <type_traits>           // for std::void_t, std::is_nothrow_*
+#include <utility>               // for std::declval, std::forward
 
 // Tracing and coloring are optional and fully injectable. Define
 // STASH_TRACE_HEADER (a header path) before including this file to plug in your
@@ -79,6 +79,13 @@ inline T* stash_reserved() noexcept {
 #define STASH_FAR_STAT()
 #endif
 
+// Per-walk-start hold statistics, a no-op unless defined before this header:
+// the board scan capped first_valid lower because of the overflow counter
+// (`overflow`) or a previous-epoch far insert still in flight (`far_pin`).
+#ifndef STASH_HELD_STAT
+#define STASH_HELD_STAT(overflow, far_pin)
+#endif
+
 
 // Each thread's preferred announce slot; it moves to wherever the thread last
 // found a free one.
@@ -105,13 +112,9 @@ struct StashContext {
 
 	// The window: keys below atom_window announce on the board; keys at or past
 	// it only count themselves in their epoch. A move sets the window to the
-	// floor plus WINDOW_WIDE chunks of WINDOW_CHUNK finest slots, or one chunk
-	// when the last scan found at least WINDOW_NARROW_AT slots taken; it widens
-	// again once a scan finds at most WINDOW_WIDEN_AT.
+	// floor plus WINDOW_WIDE chunks of WINDOW_CHUNK finest slots.
 	static constexpr unsigned long long WINDOW_CHUNK = 4;
 	static constexpr unsigned long long WINDOW_WIDE = 16;
-	static constexpr size_t WINDOW_NARROW_AT = ANNOUNCE_SLOTS / 2;
-	static constexpr size_t WINDOW_WIDEN_AT = ANNOUNCE_SLOTS / 8;
 
 	Operation op;
 
@@ -155,11 +158,9 @@ struct StashContext {
 	unsigned long long first_valid_cap;
 	unsigned depth = 0;
 	// The window last published, the one before it (whose epoch may still have
-	// far inserts in flight), its current width, and what the last scan saw.
+	// far inserts in flight), and whether the last scan found that epoch live.
 	unsigned long long window;
 	unsigned long long prev_window;
-	unsigned long long window_width = 0;   // set at the first move
-	size_t occupancy = 0;
 	bool far_pinned = false;
 
 	std::array<Announce, ANNOUNCE_SLOTS> announce;
@@ -179,8 +180,6 @@ struct StashContext {
 		  first_valid_cap(o.first_valid_cap),
 		  window(o.window),
 		  prev_window(o.prev_window),
-		  window_width(o.window_width),
-		  occupancy(o.occupancy),
 		  far_pinned(o.far_pinned),
 		  atom_insert_floor(o.atom_insert_floor.load()),
 		  atom_window(o.atom_window.load()) { }
@@ -280,7 +279,7 @@ struct StashContext {
 	// once it has moved a finest slot, then read the announces. Until the next
 	// refresh the walk keeps first_valid at or below the lowest announce, the
 	// floor, and (with overflowed producers in flight) where it was.
-	void refresh_first_valid_cap(unsigned long long period) {
+	void refresh_first_valid_cap(unsigned long long period) noexcept {
 		// Only where a walk starts (at first_valid): a snapshot must predate every
 		// read of the walk whose first_valid it bounds, not just this call's.
 		if (op != Operation::walk || !end_key ||
@@ -303,13 +302,9 @@ struct StashContext {
 		// the other parity, so a producer's recheck tells them apart.
 		auto chunk = period * WINDOW_CHUNK;
 		if (!far_pinned && (insert_floor >= window || window - insert_floor < chunk)) {
-			if (occupancy >= WINDOW_NARROW_AT) {
-				window_width = chunk;
-			} else if (occupancy <= WINDOW_WIDEN_AT || !window_width) {
-				window_width = chunk * WINDOW_WIDE;
-			}
 			constexpr auto max_key = std::numeric_limits<unsigned long long>::max();
-			auto w = insert_floor > max_key - window_width ? max_key - 1 : insert_floor + window_width;
+			auto width = chunk * WINDOW_WIDE;
+			auto w = insert_floor > max_key - width ? max_key - 1 : insert_floor + width;
 			if (w <= window) {
 				w = window + 1;
 			}
@@ -321,39 +316,38 @@ struct StashContext {
 			atom_window.store(w, std::memory_order_seq_cst);
 		}
 		auto cap = insert_floor;
-		size_t taken = 0;
 		unsigned long long far_count = 0;
 		for (auto& a : announce) {
 			auto k = a.key.load(std::memory_order_seq_cst);
-			if (k != IDLE) {
-				++taken;
-			}
 			if (k < cap) {
 				cap = k;
 			}
 			far_count += a.far[prev_window & 1].load(std::memory_order_seq_cst);
 		}
-		if (atom_announce_overflow.load(std::memory_order_seq_cst)) {
-			taken = ANNOUNCE_SLOTS;
-			auto f = atom_first_valid_key.load(std::memory_order_relaxed);
-			if (f < cap) {
-				cap = f;
-			}
-		}
-		occupancy = taken;
 		// Far inserts of the current epoch have keys at or past the window; those
 		// of the previous one, at or past the previous window.
 		if (window < cap) {
 			cap = window;
 		}
+		// The overflow and far-pin holds, each when it lowers the cap further.
+		[[maybe_unused]] auto board_cap = cap;
+		if (atom_announce_overflow.load(std::memory_order_seq_cst)) {
+			auto f = atom_first_valid_key.load(std::memory_order_relaxed);
+			if (f < cap) {
+				cap = f;
+			}
+		}
 		far_pinned = far_count != 0;
 		if (far_pinned && prev_window < cap) {
 			cap = prev_window;
 		}
+		// The arguments are evaluated only in builds that define the hook.
+		STASH_HELD_STAT(cap < board_cap && !(far_pinned && cap == prev_window),
+		                cap < board_cap && far_pinned && cap == prev_window);
 		first_valid_cap = cap;
 	}
 
-	bool check(unsigned long long key, unsigned long long limit_key) const {
+	bool check(unsigned long long key, unsigned long long limit_key) const noexcept {
 		if (end_key && key >= end_key) {
 			return false;
 		}
@@ -618,8 +612,11 @@ public:
 
 	StashSlots() = default;
 
+	// walk, peep and clean never allocate (every get() passes spawn == false), so
+	// they throw only if the leaf's value operations can (StashValues::nothrow_next).
 	template <typename T>
-	bool next(StashContext& ctx, T* value_ptr, unsigned long long limit_key) {
+	bool next(StashContext& ctx, T* value_ptr, unsigned long long limit_key)
+	    noexcept(noexcept(std::declval<_Tp&>().next(ctx, value_ptr, limit_key))) {
 		bool found = false;
 
 		// The outermost level refreshes the walk's first_valid ceiling before
@@ -737,7 +734,7 @@ public:
 	}
 
 	template <typename T>
-	bool next(StashContext& ctx, T* value_ptr) {
+	bool next(StashContext& ctx, T* value_ptr) noexcept(noexcept(std::declval<_Tp&>().next(ctx, value_ptr, 0))) {
 		return next(ctx, value_ptr, 0);
 	}
 
@@ -764,8 +761,10 @@ public:
 		ptr->put(ctx, key, std::forward<Args>(args)...);
 	}
 
+	// False, storing nothing, when the key is past the horizon; true once placed.
+	// Allocation failure (std::bad_alloc) propagates.
 	template<typename... Args>
-	void add(StashContext& ctx, unsigned long long key, Args&&... args) {
+	bool add(StashContext& ctx, unsigned long long key, Args&&... args) {
 		// Announce before touching the tree; a key already below the insert floor
 		// (overdue past the last walk's end) is filed at the floor instead.
 		StashContext::InFlight in_flight(ctx, key);
@@ -779,11 +778,12 @@ public:
 			horizon -= ctx.horizon_margin;
 		}
 		if (key >= horizon) {
-			throw std::out_of_range("stash overflow");
+			return false;
 		}
 
 		L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load());
 		put(ctx, key, std::forward<Args>(args)...);
+		return true;
 	}
 };
 
@@ -816,8 +816,15 @@ public:
 		  clean_cur(0),
 		  atom_end(0) { }
 
+	// The walk copies a value out (T = _Tp), tests it and its pointee as bool,
+	// and deletes its box; nothing else it does can throw.
 	template <typename T>
-	bool next(StashContext& ctx, T* value_ptr, unsigned long long) {
+	static constexpr bool nothrow_next =
+	    std::is_nothrow_assignable_v<T&, _Tp&> && std::is_nothrow_destructible_v<_Tp> &&
+	    noexcept(static_cast<bool>(std::declval<_Tp&>()) && static_cast<bool>(*std::declval<_Tp&>()));
+
+	template <typename T>
+	bool next(StashContext& ctx, T* value_ptr, unsigned long long) noexcept(nothrow_next<T>) {
 		const auto sentinel = stash_reserved<_Tp>();
 		const bool is_clean = (ctx.op == StashContext::Operation::clean);
 		const bool is_walk = (ctx.op == StashContext::Operation::walk);

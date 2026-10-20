@@ -128,15 +128,18 @@ struct StashContext {
 	struct alignas(64) Announce {
 		std::atomic_ullong key{IDLE};
 	};
+
+	// Consumer-only, on a line of their own: the floor last published, the
+	// first_valid ceiling read with it, and the walk's recursion depth (the floor
+	// is refreshed at depth 1). The walk writes depth on every level of every
+	// call; sharing a line with the floor would invalidate it for every producer.
+	alignas(64) unsigned long long insert_floor;
+	unsigned long long first_valid_cap;
+	unsigned depth = 0;
+
 	std::array<Announce, ANNOUNCE_SLOTS> announce;
 	alignas(64) std::atomic_ullong atom_announce_overflow{0};
 	alignas(64) std::atomic_ullong atom_insert_floor;
-
-	// Consumer-only: the floor last published, the first_valid ceiling read with
-	// it, and the walk's recursion depth (the floor is refreshed at depth 0).
-	unsigned long long insert_floor;
-	unsigned long long first_valid_cap;
-	unsigned depth = 0;
 
 	StashContext(StashContext&& o) noexcept
 		: op(std::move(o.op)),
@@ -146,9 +149,9 @@ struct StashContext {
 		  atom_last_valid_key(o.atom_last_valid_key.load()),
 		  horizon_margin(o.horizon_margin),
 		  pending_floor(o.pending_floor),
-		  atom_insert_floor(o.atom_insert_floor.load()),
 		  insert_floor(o.insert_floor),
-		  first_valid_cap(o.first_valid_cap) { }
+		  first_valid_cap(o.first_valid_cap),
+		  atom_insert_floor(o.atom_insert_floor.load()) { }
 
 	explicit StashContext(unsigned long long begin_key)
 		: op(Operation::walk),
@@ -156,9 +159,9 @@ struct StashContext {
 		  end_key(begin_key),
 		  atom_first_valid_key(begin_key),
 		  atom_last_valid_key(begin_key),
-		  atom_insert_floor(begin_key),
 		  insert_floor(begin_key),
-		  first_valid_cap(begin_key) { }
+		  first_valid_cap(begin_key),
+		  atom_insert_floor(begin_key) { }
 
 	// Producer side: an insert in flight. Announces before the descent and yields
 	// the key to file under (never below the insert floor); the destructor
@@ -680,7 +683,7 @@ public:
 			horizon -= ctx.horizon_margin;
 		}
 		if (key >= horizon) {
-			throw std::out_of_range("stash overlow");
+			throw std::out_of_range("stash overflow");
 		}
 
 		L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load());

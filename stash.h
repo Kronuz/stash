@@ -79,6 +79,13 @@ inline T* stash_reserved() noexcept {
 #define STASH_FAR_STAT()
 #endif
 
+// Runs before every allocation stash makes (a node, a chunk, a child level, a
+// value box), a no-op unless defined before this header; a test defines it to
+// throw std::bad_alloc at a chosen site.
+#ifndef STASH_ALLOC_HOOK
+#define STASH_ALLOC_HOOK()
+#endif
+
 // Per-walk-start hold statistics, a no-op unless defined before this header:
 // the board scan capped first_valid lower because of the overflow counter
 // (`overflow`) or a previous-epoch far insert still in flight (`far_pin`).
@@ -477,6 +484,7 @@ protected:
 						if (cursor) { cursor->node = _data; cursor->base = c * _Size; }
 						return StashState::StashShort;
 					}
+					STASH_ALLOC_HOOK();
 					auto tmp = std::make_unique<Data>();
 					// release on success publishes the new node; acquire on failure
 					// loads the winner so we then read its contents safely.
@@ -495,6 +503,7 @@ protected:
 				if (!spawn) {
 					return StashState::ChunkEmpty;
 				}
+				STASH_ALLOC_HOOK();
 				auto tmp = std::make_unique<Chunks>();
 				if constexpr (_Reserved) {
 					// Mark every slot reserved before publishing the array, so a
@@ -749,6 +758,7 @@ public:
 		auto& atom_ptr = *ptr_atom_ptr;
 		auto ptr = atom_ptr.load(std::memory_order_acquire);
 		if (!ptr) {
+			STASH_ALLOC_HOOK();
 			auto tmp = std::make_unique<_Tp>();
 			// release publishes the new child subtree; acquire on failure loads the
 			// winner so the recursive put() below descends into a visible node.
@@ -935,16 +945,29 @@ public:
 
 	template<typename... Args>
 	void put(StashContext& ctx, unsigned long long key, Args&&... args) {
-		// RESERVE: claim a slot and ensure its physical location exists. The path
-		// to this leaf was already built during descent, so the consumer can reach
-		// it the instant the bound below is published. relaxed: the slot index is
-		// private, and this increment is made visible to the consumer's pending
-		// check by the bound's release-store below (sequenced after it).
-		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
-		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}slot:{}, atom_end:{}, op:{}", ctx._col(), slot, atom_end.load(), ctx._op());
+		// Everything that can throw (the value box and its constructor, the leaf's
+		// nodes and chunks) happens before the reserve: a reserved slot that is
+		// never filled is a hole the walk parks on for good, pinning first_valid.
+		STASH_ALLOC_HOOK();
+		auto value = std::make_unique<_Tp>(std::forward<Args>(args)...);
 
+		// RESERVE: claim the next slot only once its chunk exists, so a failure
+		// reserves nothing. The path to this leaf was already built during descent,
+		// so the consumer can reach it the instant the bound below is published.
+		// relaxed: the slot index is private, and the claim is made visible to the
+		// consumer's pending check by the bound's release-store below.
 		std::atomic<_Tp*>* ptr_atom_ptr;
+		auto slot = atom_end.load(std::memory_order_relaxed);
 		Stash_T::get(&ptr_atom_ptr, slot, true);
+		for (auto got = slot; !atom_end.compare_exchange_weak(slot, slot + 1,
+		         std::memory_order_relaxed, std::memory_order_relaxed); got = slot) {
+			if (slot / _Size == got / _Size) {
+				ptr_atom_ptr += slot - got;   // same chunk: no walk, no allocation
+			} else {
+				Stash_T::get(&ptr_atom_ptr, slot, true);
+			}
+		}
+		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}slot:{}, atom_end:{}, op:{}", ctx._col(), slot, atom_end.load(), ctx._op());
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
 		// `key`, so a walk can descend to this leaf while the slot is still a
@@ -967,11 +990,10 @@ public:
 		auto& atom_ptr = *ptr_atom_ptr;
 		auto ptr = atom_ptr.load(std::memory_order_relaxed);
 		if (ptr == stash_reserved<_Tp>()) {
-			auto tmp = std::make_unique<_Tp>(std::forward<Args>(args)...);
-			if (atom_ptr.compare_exchange_strong(ptr, tmp.get(),
+			if (atom_ptr.compare_exchange_strong(ptr, value.get(),
 			        std::memory_order_release, std::memory_order_relaxed)) {
-				ptr = tmp.release();
-			}  // else: unique_ptr frees the loser (exception-safe)
+				value.release();
+			}  // else: unique_ptr frees the value
 		}
 		// No commit step and no extra publish: the FILL's release CAS publishes the
 		// value, and the consumer reads atom_end with an RMW (always fresh) plus each

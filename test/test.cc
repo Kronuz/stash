@@ -17,12 +17,16 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <new>
 #include <vector>
 
 // The stats hooks, counted here to check where they fire.
 static unsigned long long g_overflows = 0, g_held_overflow = 0, g_held_far = 0;
 #define STASH_ANNOUNCE_STAT(probes, overflowed) (g_overflows += (overflowed))
 #define STASH_HELD_STAT(overflow, far_pin) (g_held_overflow += (overflow), g_held_far += (far_pin))
+// Fails the g_fail_at-th allocation (counting from 1) with std::bad_alloc; 0 = off.
+static int g_fail_at = 0;
+#define STASH_ALLOC_HOOK() (g_fail_at && --g_fail_at == 0 ? throw std::bad_alloc() : (void)0)
 #include "stash.h"
 
 // The smoke test types: a single keyed level (Div=1, Mod=8) over a leaf.
@@ -347,11 +351,56 @@ static void test_descent_window() {
 	std::printf("stash OK: in-flight inserts pin first_valid; late inserts still fire\n");
 }
 
+// An add that fails to allocate (any site: a node, a chunk, a child level, the
+// value box) stores nothing and leaves no reserved hole: the walk still drains
+// and advances first_valid past the key, and a later add one span out is not
+// refused. Both a fresh leaf and a full leaf chunk (the add grows the chain).
+static void test_alloc_failure() {
+	for (int prefill : {0, 4}) {
+		for (int fail_at = 1;; ++fail_at) {
+			Wheel wheel;
+			StashContext ctx(0ULL);
+			std::vector<int> got;
+			for (int i = 0; i < prefill; ++i) {
+				wheel.add(ctx, 3, std::make_shared<int>(30 + i));
+			}
+			auto value = std::make_shared<int>(99);
+			bool threw = false;
+			g_fail_at = fail_at;
+			try {
+				wheel.add(ctx, 3, value);
+			} catch (const std::bad_alloc&) {
+				threw = true;
+			}
+			g_fail_at = 0;
+			if (!threw) {
+				assert(fail_at > 1 && "the add allocated nothing");
+				break;
+			}
+			assert(value.use_count() == 1 && "a failed add kept the value");
+			for (auto& a : ctx.announce) {
+				assert(a.key.load() == StashContext::IDLE && "a failed add left its announce");
+			}
+			drain(wheel, ctx, 8, got);
+			assert(static_cast<int>(got.size()) == prefill && "a failed add lost or stored a value");
+			assert(ctx.atom_first_valid_key.load() > 3 && "a failed add left a hole pinning first_valid");
+			drain(wheel, ctx, 9, got);
+			bool added = wheel.add(ctx, 3 + 8 + 4, std::make_shared<int>(7));
+			assert(added && "first_valid stuck: an add one span out was refused");
+			drain(wheel, ctx, 16, got);
+			assert(got.size() == static_cast<size_t>(prefill) + 1 && got.back() == 7);
+			(void)added;
+		}
+	}
+	std::printf("stash OK: a failed allocation in add leaves no hole; first_valid advances\n");
+}
+
 int main() {
 	test_smoke();
 	test_low_key_no_underflow();
 	test_high_key_span_guard();
 	test_descent_window();
+	test_alloc_failure();
 	std::printf("all stash tests passed\n");
 	return 0;
 }

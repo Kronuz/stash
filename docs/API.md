@@ -32,6 +32,9 @@ trials; ARCHITECTURE.md, "Observing overflow"):
 - `STASH_HELD_STAT(overflow, far_pin)` — per walk start whose board scan capped
   `first_valid` lower, by cause: the overflow counter, or a far insert of the
   previous window epoch still in flight.
+- `STASH_ALLOC_HOOK()` — before every allocation stash makes (a node, a chunk, a
+  child level, a value box); `test/test.cc` defines it to fail one site with
+  `std::bad_alloc`.
 - `InFlight(ctx, key)` — RAII announce of one insert; `key()` is the key to file
   under. `add` uses it; a caller of `put` that races a walk needs one too.
 - `check(key, limit_key)` — the loop predicate: stops when `key` reaches
@@ -60,7 +63,9 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
   floor; it fires on the next walk. Returns true once the value is placed, and
   false, storing nothing, if the key is beyond the wheel span `[first_valid_key,
   first_valid_key + Div*Mod)` (less `horizon_margin`). Throws only
-  `std::bad_alloc`, from a node, chunk or value allocation.
+  `std::bad_alloc` (or what the value's constructor throws), always before the
+  leaf slot is claimed: a failed `add` stores nothing, releases its announce and
+  leaves no hole, so the walk keeps advancing `first_valid`.
 - `finest_div` — the finest slot width below this level; the walk refreshes its
   in-flight snapshot at most once per `finest_div` keys.
 - `next(ctx, value_ptr [, limit_key])` — walks the key window in `ctx.op` mode,

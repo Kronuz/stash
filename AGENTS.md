@@ -73,6 +73,10 @@ Breaking one of these produces silent loss or a race, not a compile error.
   (`get_slot`), and `get_base_key`, `get_inc_base_key`, `get_dec_base_key`, and
   `get_end_base_key` derive from `_Div` and `_Mod`. The walk uses them to set
   child `limit_key`s and to advance `atom_first_valid_key`.
+- **Nothing throws after a leaf reserve.** `StashValues::put` allocates the value
+  box and the slot's chunk before it claims the slot (a CAS on `atom_end`); a
+  reserved slot that is never filled pins `first_valid` for good. Keep every
+  allocation and throwing operation ahead of the claim.
 - **Publish via CAS.** Every structural install (a `Data` node, a chunk, a child
   level, a leaf value) allocates, `compare_exchange_strong`s, and on a lost race
   deletes its own allocation and adopts the winner's.

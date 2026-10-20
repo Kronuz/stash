@@ -210,9 +210,12 @@ struct StashContext {
 	// Consumer side, at the start of a walk: publish the insert floor (end_key - 1)
 	// once it has moved a finest slot, then read the announces. Until the next
 	// refresh the walk keeps first_valid at or below the lowest announce, the
-	// floor, and (with overflowed producers in flight) where it stands now.
+	// floor, and (with overflowed producers in flight) where it was.
 	void refresh_first_valid_cap(unsigned long long period) {
-		if (op != Operation::walk || !end_key) {
+		// Only where a walk starts (at first_valid): a snapshot must predate every
+		// read of the walk whose first_valid it bounds, not just this call's.
+		if (op != Operation::walk || !end_key ||
+		    begin_key > atom_first_valid_key.load(std::memory_order_relaxed)) {
 			return;
 		}
 		auto floor = end_key - 1;

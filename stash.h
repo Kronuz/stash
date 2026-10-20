@@ -67,6 +67,14 @@ inline T* stash_reserved() noexcept {
 }
 
 
+// Per-insert announce statistics, a no-op unless defined before this header:
+// `probes` slots were tried past the hinted one (0 = the hint was free), and
+// `overflowed` is true when none was and the insert took the overflow counter.
+#ifndef STASH_ANNOUNCE_STAT
+#define STASH_ANNOUNCE_STAT(probes, overflowed)
+#endif
+
+
 // Each thread's preferred announce slot; it moves to wherever the thread last
 // found a free one.
 inline unsigned& stash_announce_hint() noexcept {
@@ -167,7 +175,8 @@ struct StashContext {
 			auto floor = ctx.atom_insert_floor.load(std::memory_order_relaxed);
 			auto announced = key < floor ? floor : key;
 			auto& hint = stash_announce_hint();
-			for (size_t i = 0; i < ANNOUNCE_SLOTS; ++i) {
+			size_t i = 0;
+			for (; i < ANNOUNCE_SLOTS; ++i) {
 				auto idx = (hint + i) % ANNOUNCE_SLOTS;
 				auto& a = ctx.announce[idx].key;
 				auto idle = IDLE;
@@ -185,6 +194,7 @@ struct StashContext {
 				overflow = &ctx.atom_announce_overflow;
 				overflow->fetch_add(1, std::memory_order_seq_cst);
 			}
+			STASH_ANNOUNCE_STAT(i, !slot);
 			// Either the walk saw the announce, or this load sees its floor.
 			floor = ctx.atom_insert_floor.load(std::memory_order_seq_cst);
 			key_ = key < floor ? floor : key;

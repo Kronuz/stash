@@ -22,6 +22,7 @@ cmake --build build
 ./build/bench_structures           # stash vs mutex-deque / Vyukov MPSC / sharded queue / heap
 ./build/bench_scheduler            # stash vs asio::steady_timer vs mutex+heap
 
+./build/bench_bursty 2 8 500 2000 256 1024   # many mostly-idle producers
 ./build/bench_structures 4000000   # optional: override total op count
 ```
 
@@ -35,6 +36,7 @@ additionally fetches standalone [Asio](https://github.com/chriskohlhoff/asio)
 | --- | --- | --- |
 | `bench_structures` | stash, `mutex`+heap, `mutex`+multimap, `mutex`+deque, lock-free Vyukov MPSC, per-producer sharded queue | data-structure insert cost, scheduler role vs hand-off role |
 | `bench_scheduler` | stash, `mutex`+heap, `asio::steady_timer` | the scheduler shoot-out: arming timed tasks from many threads |
+| `bench_bursty` | stash | hundreds to thousands of threads adding short bursts between sleeps: add latency, announce hint misses and overflows, lost tasks |
 
 See [RESULTS.md](RESULTS.md) for a representative run, the methodology, and the
 one caveat that matters when reading the tables.

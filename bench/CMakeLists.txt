@@ -5,6 +5,7 @@
 #   ./build/bench_structures      # stash vs queues (no external deps)
 #   ./build/bench_steady          # bounded-depth arm latency (the queue-depth regime)
 #   ./build/bench_scheduler       # stash vs asio::steady_timer vs heap
+#   ./build/bench_bursty          # many mostly-idle producers (Xapiand's deferred logging)
 #
 # bench_structures has no dependencies beyond stash.h. bench_steady and
 # bench_scheduler also compare against asio::steady_timer, fetched standalone
@@ -27,6 +28,12 @@ set(STASH_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 add_executable(bench_structures bench_structures.cc)
 target_include_directories(bench_structures PRIVATE ${STASH_ROOT})
 target_link_libraries(bench_structures PRIVATE Threads::Threads)
+
+# Hundreds to thousands of producers adding in short bursts between sleeps; no
+# dependencies beyond stash.h.
+add_executable(bench_bursty bench_bursty.cc)
+target_include_directories(bench_bursty PRIVATE ${STASH_ROOT})
+target_link_libraries(bench_bursty PRIVATE Threads::Threads)
 
 # The scheduler shoot-out needs standalone Asio for asio::steady_timer.
 include(FetchContent)

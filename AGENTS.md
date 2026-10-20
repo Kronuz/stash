@@ -12,6 +12,7 @@ stash.h                  The library: Stash, StashSlots, StashValues, StashConte
 stash_trace.h            No-op default tracing and color hooks.
 test/test.cc             Smoke and regression tests (CTest: stash).
 test/concurrent.cc       Many producers and one walking, cleaning consumer: every task fires once.
+test/trace_throw.cc      A throwing trace inside add leaves no hole (CTest: stash_trace_throw).
 test/longevity.cc        Wheel memory over many wraparounds: bounded with clean, growing without.
 examples/demo.cc         A tour of the structure (target stash_demo).
 examples/colored_trace/  Injecting a trace header for colored tracing.

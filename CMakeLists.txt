@@ -13,6 +13,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(stash_test test/test.cc)
   target_link_libraries(stash_test PRIVATE stash)
   add_test(NAME stash COMMAND stash_test)
+  # A trace hook that throws inside add must not strand a claimed slot.
+  add_executable(stash_trace_throw test/trace_throw.cc)
+  target_link_libraries(stash_trace_throw PRIVATE stash)
+  add_test(NAME stash_trace_throw COMMAND stash_trace_throw)
   # Producers racing the walking cleaner for 2 s with tasks due at now() (no
   # lead, the descent window's worst case); exits nonzero on a lost or
   # double-fired task, so the sanitizer jobs check reclamation too. For a longer,

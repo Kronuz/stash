@@ -196,6 +196,7 @@ static void test_high_key_span_guard() {
 		StashContext ctx(0ULL);
 
 		auto value = std::make_shared<int>(9);
+		assert(wheel.horizon(ctx) == span && "horizon() disagrees with the span");
 		auto result = wheel.add(ctx, span, value);  // key == horizon.
 		assert(result == stash_result::past_horizon && "key at/beyond horizon should be rejected");
 		assert(value.use_count() == 1 && "a rejected add kept a copy of the value");

@@ -800,26 +800,28 @@ public:
 		StashContext::InFlight in_flight(ctx, key);
 		key = in_flight.key();
 
-		// R2: the schedulable horizon, minus an optional keep-out zone. Rejecting
-		// keys within horizon_margin of the end stops a near-horizon insert from
-		// aliasing onto a slot being reclaimed one wheel period below.
-		auto horizon = get_end_base_key(ctx.atom_first_valid_key.load(std::memory_order_acquire));
-		if (horizon > ctx.horizon_margin) {
-			horizon -= ctx.horizon_margin;
-		}
-		if (key >= horizon) {
+		if (key >= horizon(ctx)) {
 			return stash_result::past_horizon;
 		}
 
-		L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load());
 		try {
+			L_STASH("StashSlots::" + LIGHT_PURPLE + "ADD" + CLEAR_COLOR + " - _Mod:{}, key:{}, atom_first_valid_key:{}, atom_last_valid_key:{}", _Mod, key, ctx.atom_first_valid_key.load(), ctx.atom_last_valid_key.load());
 			put(ctx, key, std::forward<Args>(args)...);
 		} catch (const std::bad_alloc&) {
-			// Only before the leaf claim: the levels above it or the value box. The
-			// partial path stays (empty nodes), and InFlight retracts the announce.
+			// Only before the leaf claim: the levels above it, the value box, or a
+			// trace. The partial path stays (empty nodes), and InFlight retracts
+			// the announce.
 			return stash_result::no_memory;
 		}
 		return stash_result::placed;
+	}
+
+	// The first key add() refuses as past_horizon: one wheel span past the slot of
+	// first_valid, less horizon_margin (R2: a keep-out zone so a near-horizon insert
+	// cannot alias a slot being reclaimed one period below). It only grows.
+	unsigned long long horizon(const StashContext& ctx) const noexcept {
+		auto end = get_end_base_key(ctx.atom_first_valid_key.load(std::memory_order_acquire));
+		return end > ctx.horizon_margin ? end - ctx.horizon_margin : end;
 	}
 };
 
@@ -981,6 +983,8 @@ public:
 		// it the instant the bound below is published. relaxed: the slot index is
 		// private, and this increment is made visible to the consumer's pending
 		// check by the bound's release-store below (sequenced after it).
+		// Traced before the claim: a trace that throws must not strand a slot.
+		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}atom_end:{}, op:{}", ctx._col(), atom_end.load(), ctx._op());
 		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
 		std::atomic<_Tp*>* ptr_atom_ptr;
 		try {
@@ -990,7 +994,7 @@ public:
 			// slot is a permanent hole, so fail fast rather than run with one.
 			stash_out_of_memory_after_claim();
 		}
-		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}slot:{}, atom_end:{}, op:{}", ctx._col(), slot, atom_end.load(), ctx._op());
+		// Nothing after the claim may throw: no trace, no allocation.
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
 		// `key`, so a walk can descend to this leaf while the slot is still a

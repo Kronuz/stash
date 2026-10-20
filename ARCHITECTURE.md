@@ -561,7 +561,10 @@ latencies.
 - **The walk does not throw.** `next` (walk, peep, clean) allocates nothing and is
   `noexcept` when the value type's copy-assignment, bool tests and destructor are
   (a `shared_ptr` value is). An injected trace header that throws from `L_STASH`
-  or `L_DEBUG_HOOK` inside it would terminate.
+  or `L_DEBUG_HOOK` inside the walk terminates it. In `add` every trace runs
+  before the leaf claim, so a trace that throws `std::bad_alloc` returns
+  `no_memory` with nothing claimed (`test/trace_throw.cc`); nothing after the
+  claim traces.
 
 ## Possible improvements
 

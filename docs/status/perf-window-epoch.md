@@ -35,6 +35,13 @@ handshake; not merged. Results in `docs/perf/window-epoch.md` ("Fixed width" for
 2. A timed run on Linux and arm64 (CI covers correctness only).
 3. After this lands: repin Kronuz/scheduler's stash from d234d24 to main.
 
+- Code review (`review-wt/stash/docs/reviews/window-refusals-code.md`, APPROVE WITH CONDITIONS):
+  C3 fixed: every trace in `add` now runs before the leaf claim (`StashValues::put`'s trace moved
+  ahead of the fetch-add, `add`'s own trace inside its `try`), so a throwing trace returns
+  `no_memory` with nothing claimed; `test/trace_throw.cc` (CTest `stash_trace_throw`) and the
+  reviewer's `trace_after_claim.cc` fail on the previous code and pass now. `horizon(ctx)` is
+  public, one implementation for `add` and for Kronuz/scheduler's horizon check (CR2).
+
 ## Blocked on
 
 Nothing. The owner chose fail-fast over the CAS claim's cost.

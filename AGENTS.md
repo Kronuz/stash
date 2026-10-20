@@ -31,10 +31,13 @@ The `stash` target (alias `stash::stash`) is an `INTERFACE` library requesting
 `cxx_std_17`. CTest runs `stash_test`, which prints
 `stash OK: walked 3 values in key order: 11 22 33`.
 
-`test/concurrent.cc` runs in CTest as `stash_concurrent` (4 producers, 2 s, 20 ms lead), so the
-CI sanitizer jobs cover reclamation; run it longer by hand with
-`build/stash_concurrent PRODUCERS SECONDS`. `test/longevity.cc` is a manual tool (it
-replaces global `new`, so not under ASan, and always exits 0):
+`test/concurrent.cc` runs in CTest as `stash_concurrent` (4 producers, 2 s, tasks due at
+`now()`), so the CI sanitizer jobs cover reclamation and the descent window. Run it
+longer by hand with `build/stash_concurrent PRODUCERS SECONDS`, or repeat it
+oversubscribed with `test/stress.sh build/stash_concurrent RUNS PRODUCERS SECONDS
+LEAD_MS HOGS` (HOGS nice'd busy loops preempt producers mid-insert, which macOS cannot
+force with `taskset`). `test/longevity.cc` is a manual tool (it replaces global `new`,
+so not under ASan, and always exits 0):
 
 ```sh
 c++ -std=c++17 -O2 -pthread -I. test/longevity.cc -o longevity && ./longevity
@@ -77,11 +80,19 @@ Breaking one of these produces silent loss or a race, not a compile error.
 - **The sentinel frontier.** A leaf chunk is filled with `stash_reserved<T>()`
   before it is published, and a reserved slot keeps the sentinel until its value
   lands. The walk parks on the first sentinel and never steps past it.
-- **`first_valid` is the reclamation boundary.** The walk caps its advance at
-  `pending_floor` (the lowest pending leaf seen this walk); a late insert lowers
-  `first_valid` before its value is published; `clean` frees only subtrees
-  entirely below it. The consumer resets `pending_floor` to `IDLE` at the start
-  of each walk.
+- **`first_valid` is the reclamation boundary, and only the walk writes it.** The
+  walk caps its advance at `pending_floor` (the lowest pending leaf seen this walk)
+  and at `first_valid_cap` (the lowest in-flight announce it read); `clean` frees
+  only subtrees entirely below it. The consumer resets `pending_floor` to `IDLE`
+  at the start of each walk.
+- **Announce before descending.** `add` claims an announce slot (seq_cst) before
+  its first pointer load, then reads `atom_insert_floor` (seq_cst) and files a key
+  below it at the floor. The outermost `StashSlots::next` of a call that starts a
+  walk at `first_valid` stores the floor (seq_cst) before it reads the slots or
+  the tree; a later call's snapshot would not cover ranges the walk already
+  passed. That store-load pair keeps `first_valid` at or below every insert in
+  flight; weakening either side to acquire/release reopens the descent window.
+  `first_valid <= atom_insert_floor` always.
 - **Pointer-like, non-null values.** The walk's liveness test is `*ptr && **ptr`;
   a null or "zero" value reads as absent.
 
@@ -108,6 +119,11 @@ Breaking one of these produces silent loss or a race, not a compile error.
 - **Overflow throws.** `add` throws `std::out_of_range("stash overflow")` past one
   span (less `horizon_margin`) from `atom_first_valid_key`; the scheduler drains
   as its clock advances.
+- **Insert through `add`, not `put`.** `put` skips the announce, so a `put`
+  racing the walk can be skipped or freed under; `add` is the concurrent entry
+  point.
+- **A stalled producer pins `first_valid`.** Its announce holds the low-water mark
+  (and so `clean` and the horizon) until it resumes; walks keep firing above it.
 - **Destruction is manual and not concurrent.** `Data::~Data` frees the node
   chain and chunks by hand; destroy a structure only when no producer or consumer
   touches it.
@@ -117,14 +133,6 @@ Breaking one of these produces silent loss or a race, not a compile error.
 This is `stash.h` extracted from [Xapiand](https://github.com/Kronuz/Xapiand),
 with Xapiand's `log.h` and color palette replaced by the injectable trace hooks.
 Since the extraction it gained the sentinel frontier and walk-based `clean`
-([STRAND_FIX.md](STRAND_FIX.md)). Keep extraction hygiene separate from algorithm
+([STRAND_FIX.md](STRAND_FIX.md)) and the in-flight announce (ARCHITECTURE.md,
+"Inserts in flight"). Keep extraction hygiene separate from algorithm
 changes so the two can be reconciled with Xapiand.
-
-## Known defect: the descent window loses tasks under contention
-
-A task that comes due while its own insert is still descending can be skipped by the
-walk. `concurrent.cc` reproduces it with no lead: pinned to two cores on Linux
-(`taskset -c 0,1 stash_concurrent 4 2.0 32 0 0`), every run lost 200 to 350 of about
-300,000 tasks, and a 10 s final drain does not recover them; with a 20 ms lead, none. Callers that schedule work due
-almost immediately, under CPU contention, can lose it. Fix before relying on
-near-zero delays.

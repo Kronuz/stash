@@ -17,6 +17,11 @@ Carries the state for a single traversal.
 - `pending_floor` — the lowest key of a leaf seen pending during a walk; the walk
   caps its `first_valid` advance there. The consumer resets it to
   `StashContext::IDLE` before each walk.
+- `announce`, `atom_announce_overflow`, `atom_insert_floor`, `insert_floor`,
+  `first_valid_cap`, `depth` — the in-flight handshake between `add` and the walk
+  (ARCHITECTURE.md, "Inserts in flight"). Internal; leave them alone.
+- `InFlight(ctx, key)` — RAII announce of one insert; `key()` is the key to file
+  under. `add` uses it; a caller of `put` that races a walk needs one too.
 - `check(key, limit_key)` — the loop predicate: stops when `key` reaches
   `end_key`, `limit_key`, or passes `atom_last_valid_key`.
 
@@ -37,9 +42,14 @@ A keyed level over a `Stash` whose element type `T` is itself a `Stash`
 
 - `put(ctx, key, args...)` — maps `key` to slot `(key / Div) % Mod`, lazily
   creates the child level, and recurses.
-- `add(ctx, key, args...)` — `put` plus bound maintenance; throws
-  `std::out_of_range("stash overflow")` if `key` is beyond the wheel span
-  `[first_valid_key, first_valid_key + Div*Mod)`.
+- `add(ctx, key, args...)` — `put` plus the in-flight announce and bound
+  maintenance, safe to call from many threads while one consumer walks. A key
+  below `atom_insert_floor` (overdue past the last walk's end) is filed at the
+  floor; it fires on the next walk. Throws `std::out_of_range("stash overflow")`
+  if the key is beyond the wheel span `[first_valid_key, first_valid_key +
+  Div*Mod)`.
+- `finest_div` — the finest slot width below this level; the walk refreshes its
+  in-flight snapshot at most once per `finest_div` keys.
 - `next(ctx, value_ptr [, limit_key])` — walks the key window in `ctx.op` mode,
   recursing into the child level, returning the first matching value.
 

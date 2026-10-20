@@ -121,14 +121,14 @@ child level exists in that slot: if the slot's pointer is null it allocates a
 `new _Tp()` and installs it with `compare_exchange_strong`, deleting its own
 allocation on a lost race. Then it forwards `put` to the child. The recursion bottoms out at `StashValues::put`.
 
-`add(ctx, key, args...)` is `put` with bounds checking and
-bound maintenance. Before inserting it checks
+`add(ctx, key, args...)` is `put` with an announce and bounds checking. It first
+announces the insert (see "Inserts in flight" below), which may raise a key that is
+already overdue to the insert floor. It then checks
 `key >= get_end_base_key(ctx.atom_first_valid_key.load())` and throws
 `std::out_of_range("stash overflow")` if the key is more than one wheel span
-past the first valid key. After inserting, it widens the context
-bounds with CAS loops: it lowers `atom_first_valid_key` toward `key` and raises
-`atom_last_valid_key` toward `key`. These bounds are what later
-let the walk skip empty key ranges.
+past the first valid key. The leaf raises `atom_last_valid_key` toward `key`
+before filling the slot; that bound is what lets the walk skip empty key ranges.
+Producers never write `atom_first_valid_key`; only the walk does.
 
 ## The leaf: `StashValues`
 
@@ -252,11 +252,75 @@ mechanisms make `first_valid` a true reclamation boundary:
   pending, and the walk caps its `first_valid` advance at that leaf's key
   (`StashContext::pending_floor`). The low-water mark never crosses a leaf a
   producer is still filling.
-- A late insert (a key that has just gone past) lowers `first_valid` to its own
-  key before the value is published, so `clean` cannot reclaim under it.
+- An insert still descending, before it has reserved anything the walk could see,
+  holds `first_valid` through its announce (next section), so `clean` cannot
+  reclaim under it and the walk cannot step past it.
 
 Everything strictly below `first_valid` has been walked and is touched by no
-producer, so its subtree drops with no locks and no time margin. This replaced a
+producer, so its subtree drops with no locks and no time margin.
+
+### Inserts in flight
+
+The sentinel frontier makes an insert visible once it has reserved its leaf slot.
+Before that, while `add` descends, the producer holds pointers into the tree but
+has published nothing, and a task due at `now()` can come due in that window. Two
+races followed from it, and the same gap let `clean` free a subtree under the
+producer:
+
+1. The walk passed the task's slot before the producer reached it, and the
+   producer then checked `key < first_valid` against the value the walk had not
+   yet raised, so it did not lower it; the walk then raised `first_valid` past
+   the key.
+2. The producer did lower `first_valid`, and the walk's CAS-max at the end of the
+   same pass raised it again over the lowering.
+
+Either way the next walk began above the task, and `clean` eventually deleted it
+unfired. Without a lead, pinned to two cores, it lost a few hundred of about
+300,000 tasks per run; a 20 ms lead only shrank the window.
+
+The fix is a store-load handshake between `add` and the walk, on two fields of
+`StashContext`:
+
+- `announce`, an array of `ANNOUNCE_SLOTS` cache-line slots, idle at `IDLE`.
+  `add` (through `StashContext::InFlight`) claims one with a seq_cst CAS before
+  its first pointer load and stores the key it may file under. Each thread starts
+  at a remembered slot, so the claim normally hits a line it already owns.
+- `atom_insert_floor`, which the walk stores (seq_cst) as `end_key - 1` at the
+  start of a pass, before it reads the slots or the tree.
+
+After claiming, `add` reads the floor (seq_cst) and files a key below it at the
+floor. Then for every snapshot the walk takes, by the seq_cst total order either
+the walk's slot read sees the announce, or the producer's floor read sees the
+walk's floor. The walk takes the lowest announce, capped by the floor, as
+`first_valid_cap`, and never raises `first_valid` above it until it takes another
+snapshot. So:
+
+- an insert announced before the snapshot keeps `first_valid` at or below its key
+  until it finishes, and a producer that already finished released its slot, so
+  the walk that reads it idle sees its value;
+- an insert announced after the snapshot is filed at or above the floor, and
+  `first_valid <= first_valid_cap <= floor`.
+
+Either way `first_valid` never passes an insert in flight: the walk cannot strand
+it and `clean` cannot free under it. Only the walk writes `first_valid` now, so
+there is no lowering for it to overwrite.
+
+A snapshot only covers reads made after it, so the walk refreshes it from the
+outermost `StashSlots::next` and only on a call that starts at `first_valid`: a
+walk of several `next` calls continues from `begin_key`, and a snapshot taken on
+a later call would miss inserts that finished in ranges the earlier calls already
+passed. It refreshes at most once per finest slot (`StashSlots::finest_div`), so
+it costs one store and one pass over the slots per millisecond on Xapiand's
+wheel, not per task. While a snapshot shows
+a late announce holding it back, the walk re-reads the slots on each pass until
+the announce clears. More producers in flight than slots share
+`atom_announce_overflow`; while it is non-zero the cap is wherever `first_valid`
+stands, so the walk does not advance it until they finish.
+
+The visible change is for keys already overdue: a key below the floor (the last
+walk's end) is filed at the floor instead of lowering `first_valid` to it. It
+still fires on the next walk, as before; only its order among other overdue tasks
+can differ, since it now sorts at the floor. This replaced a
 margin-based `clean` (cutoff `now - margin`), which under load reclaimed
 completed but overdue tasks, and the producer commit loop the sentinel frontier
 removed; [STRAND_FIX.md](STRAND_FIX.md) records that change.
@@ -275,7 +339,8 @@ The structure is many-producer, single-consumer:
 - **Walk vs. producers.** The walk reads with `spawn == false`, so it never races
   a producer into allocating the same chunk. A value appended after the walk
   passed its slot is picked up on the next pass, gated by `atom_last_valid_key`,
-  which producers raise and the walk reads through `check`.
+  which producers raise and the walk reads through `check`, and kept in reach by
+  the producer's announce, which holds `first_valid` below it.
 
 Correctness rests on four conditions:
 
@@ -283,12 +348,10 @@ Correctness rests on four conditions:
 2. **The sentinel frontier.** A reserved slot holds the sentinel until its value
    lands, so the walk never skips a reserved slot, and `pending_floor` keeps
    reclamation from crossing a pending leaf.
-3. **Insert latency below task lead time.** The bounds and the `first_valid`
-   lowering happen during `add`, so a task that becomes due in the brief window
-   before its insert publishes can be lost. Real schedules (leads of milliseconds
-   against insert latencies of microseconds) never hit it; it appears only at a
-   sub-millisecond leading edge or when a preempted producer's latency exceeds
-   the lead. It is bounded loss, never a use-after-free.
+3. **The in-flight announce.** `add` announces before it descends and the walk
+   publishes the insert floor before it reads, both seq_cst, so `first_valid`
+   never passes an insert in flight, at any lead. A producer preempted mid-insert
+   pins `first_valid` until it resumes; walks keep firing above it.
 4. **A span the consumer keeps up with.** The wheel reuses each physical slot
    every `Div * Mod` keys, one revolution. The consumer must finish a `clean`
    pass within one revolution; a producer reusing a slot a full revolution behind
@@ -409,9 +472,12 @@ latencies.
   absent, so storing one as a live entry silently loses it.
 - **Single-consumer only.** The walk/clean cursors are non-atomic; concurrent
   walkers corrupt them. There is no internal guard against this.
-- **Pending leaves pin the walk.** A producer preempted between reserving and
-  filling a slot holds its leaf, and everything after it in that leaf, until it
-  resumes; the values are re-drained on the next pass, never lost.
+- **Pending leaves and in-flight inserts pin the walk.** A producer preempted
+  between reserving and filling a slot holds its leaf, and everything after it in
+  that leaf, until it resumes; one preempted anywhere in `add` holds
+  `first_valid`. The values are re-drained on the next pass, never lost.
+- **`put` skips the announce.** It is the unchecked insert under `add`; calling it
+  concurrently with a walk reopens the descent window.
 - **Manual destructor teardown.** `Data::~Data` tears the
   structure down by hand: it walks and deletes the `atom_next` chain, then
   deletes every value pointer in the chunk, then the chunk. It swallows

@@ -415,3 +415,11 @@ can fix. So we do not add it. If a future consumer ever runs at `lead < insert
 latency` on purpose, the right answer is to not route those keys through the wheel
 (an immediate path or a queue), the way Xapiand's logger already separates
 async-now from deferred-future.
+
+## The descent window, closed
+
+The residual this record ends on is closed. Producers now announce their key
+before descending and the walk publishes an insert floor before reading, a seq_cst
+store-load handshake that keeps `first_valid` at or below every insert in flight,
+so the walk cannot step past it and `clean` cannot free under it, at any lead.
+ARCHITECTURE.md ("Inserts in flight") has the mechanism and its proof sketch.

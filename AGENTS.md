@@ -20,6 +20,7 @@ bench/                   Benchmarks against a locked heap, Asio timers, and a lo
 docs/API.md              The API reference.
 docs/stash.d2            The README diagram's source; docs/stash.svg is rendered from it.
 STRAND_FIX.md            The record of the sentinel-frontier change.
+CHANGELOG.md             Changes since, newest first.
 ```
 
 ## Build and test
@@ -111,6 +112,10 @@ Breaking one of these produces silent loss or a race, not a compile error.
   refreshed only on such a call; a consumer that carries `begin_key` over from its
   previous walk freezes `first_valid` (no `clean`, and `add` returns `past_horizon` past one span).
   Continuing a walk with further `next` calls is fine.
+- **A leaf's claim hint moves forward only and points into its own chain.** An
+  insert resumes its hops at `atom_claim_hint` when its slot lies at or past it; a
+  node's `index()` is set before the node is published, and a node is freed only
+  with its leaf. `test_claim_walk` fails if inserts walk from the head again.
 - **Pointer-like, non-null values.** The walk's liveness test is `*ptr && **ptr`;
   a null or "zero" value reads as absent.
 
@@ -123,7 +128,7 @@ Read this before proposing stash for a new timer or deadline use. The README has
 - **Horizon.** The outermost `_Div * _Mod` from the slot of `first_valid` (24 h on Xapiand's stack). `add` returns `stash_result::past_horizon` past it and stores nothing; scheduler's `add` maps it to `schedule_result::past_horizon`. A stalled producer or a walker that has not walked holds `first_valid` back, and the horizon with it.
 - **Single walker.** `walk`, `peep`, and `clean` on one thread; `add` from any number. Beyond `ANNOUNCE_SLOTS` (64) inserts in flight below the window, the overflow counter holds `first_valid` still until they finish; the `STASH_ANNOUNCE_STAT` and `STASH_HELD_STAT` hooks report how often in a trial build.
 - **Cancel is the caller's.** There is no remove. The value is flagged dead (scheduler's `clear()`), the entry and the object it points to stay until the walk drains their slot (up to the whole remaining delay), and `peep` rescans dead entries ahead of the first live one. A later deadline is cancel plus a new `add`. Churn that slides deadlines forward (idle timeouts, election timers) accumulates about rate times delay in dead entries; use a lazy re-arm (store the new deadline, let the one pending timer re-add itself when it fires early) instead of cancel and add.
-- **Memory.** About 4.3 KB per `StashContext` by layout (the announce array; scheduler holds two), a 38 KB top-level chunk on first insert (Xapiand's stack), about 160 B per distinct finest slot in use, and per pending item an 8 B slot plus a heap-allocated value (16 B for a `shared_ptr`). One wheel per walker, not per object: a wheel per index costs about 47 KB on Xapiand's stack (two contexts and the top chunk), so 10,000 indexes hold about 470 MB before any timer is armed. Values that keep an object alive (`shared_ptr`) pin it until the slot drains; use a `weak_ptr` payload where the object can close earlier.
+- **Memory.** About 4.3 KB per `StashContext` by layout (the announce array; scheduler holds two), a 38 KB top-level chunk on first insert (Xapiand's stack), about 170 B per distinct finest slot in use, and per pending item an 8 B slot plus a heap-allocated value (16 B for a `shared_ptr`). One wheel per walker, not per object: a wheel per index costs about 47 KB on Xapiand's stack (two contexts and the top chunk), so 10,000 indexes hold about 470 MB before any timer is armed. Values that keep an object alive (`shared_ptr`) pin it until the slot drains; use a `weak_ptr` payload where the object can close earlier.
 - **Candidates that fit.** strata's per-index refresh and flush deadlines (shared host wheel, injected clock, re-arm on fire so idle indexes hold no timer); time-windowed retention drops (needs the extra level below); Xapiand's debouncers (already on it; they want the lazy re-arm in scheduler).
 - **What to use instead.** Asio `steady_timer` or `reactor::PeriodicTimer` for timers owned by one loop (connection idle, request deadlines, protocol ticks); `lru::aging_lru` for cache TTL and idle eviction; a heap owned by the thread for a few hundred timers; consensus keeps its deadlines in `Core` and takes `Tick`, so a host wants a `next_deadline()` there, not a wheel.
 - **Extending the horizon (documented, not built).** One more `StashSlots` above `4800 x 18 s` with `_Div` = 24 h and `_Mod` = 367 reaches 366 days. It adds no context memory and leaves the announce handshake and `refresh_first_valid_cap` as they are (neither depends on depth); an insert descends and a walk recurses one more level, and each distinct day in use holds its own 38 KB chunk of the 18 s level (a smaller `Size` there trades memory for hops on insert). In scheduler the geometry is load-bearing (README promises 24 h), so a longer horizon is an opt-in policy of `SchedulerQueue`, not a change to its default.

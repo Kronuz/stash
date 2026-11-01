@@ -90,6 +90,12 @@ inline T* stash_reserved() noexcept {
 #define STASH_ALLOC_HOOK()
 #endif
 
+// Runs for every chain node an insert steps over to reach its slot's chunk, a no-op
+// unless defined before this header; a test counts the steps a burst of inserts takes.
+#ifndef STASH_CHAIN_STEP_HOOK
+#define STASH_CHAIN_STEP_HOOK()
+#endif
+
 // Per-walk-start hold statistics, a no-op unless defined before this header:
 // the board scan capped first_valid lower because of the overflow counter
 // (`overflow`) or a previous-epoch far insert still in flight (`far_pin`).
@@ -433,17 +439,24 @@ protected:
 		using Chunks = std::array<std::atomic<_Tp*>, _Size>;
 		std::atomic<Chunks*> atom_chunk;
 		std::atomic<Data*> atom_next;
+		size_t chunk_index;   // this node's place in the chain (the head is 0); set before it is published
 
 	public:
-		Data()
+		explicit Data(size_t index = 0)
 			: atom_chunk(nullptr),
-			  atom_next(nullptr) { }
+			  atom_next(nullptr),
+			  chunk_index(index) { }
 
 		// Move and destroy happen single-threaded (construction / teardown of an
 		// unshared node), so these atomics need no inter-thread ordering: relaxed.
 		Data(Data&& o) noexcept
 			: atom_chunk(o.atom_chunk.load(std::memory_order_relaxed)),
-			  atom_next(o.atom_next.load(std::memory_order_relaxed)) { }
+			  atom_next(o.atom_next.load(std::memory_order_relaxed)),
+			  chunk_index(o.chunk_index) { }
+
+		size_t index() const noexcept {
+			return chunk_index;
+		}
 
 		~Data() noexcept {
 			try {
@@ -496,6 +509,9 @@ protected:
 			}
 
 			for (; c < chunk_num; ++c) {
+				if (spawn) {
+					STASH_CHAIN_STEP_HOOK();
+				}
 				// acquire: a non-null next must carry the producer's release of the
 				// node it published (below), so we see that node fully constructed.
 				auto next = _data->atom_next.load(std::memory_order_acquire);
@@ -505,7 +521,7 @@ protected:
 						return StashState::StashShort;
 					}
 					STASH_ALLOC_HOOK();
-					auto tmp = std::make_unique<Data>();
+					auto tmp = std::make_unique<Data>(c + 1);
 					// release on success publishes the new node; acquire on failure
 					// loads the winner so we then read its contents safely.
 					if (_data->atom_next.compare_exchange_strong(next, tmp.get(),
@@ -842,18 +858,25 @@ class StashValues : public Stash<_Tp, _Size, true> {
 	                                 // or drained (null); the walk reads which directly.
 	typename Stash_T::Cursor walk_cursor;    // consumer scan resume points (single
 	typename Stash_T::Cursor clean_cursor;   // consumer; each tracks its own cur)
+	// Producers: the furthest chain node a claim has resolved. A claim resumes its walk there
+	// when its slot lies at or past it, so filling a leaf of n values walks O(n) nodes in all,
+	// not O(n^2). A node lives as long as the leaf, and a claim in flight holds its announce,
+	// so the leaf (and the node) outlive every claim that reads the hint.
+	std::atomic<typename Stash_T::Data*> atom_claim_hint;
 
 public:
 	StashValues(StashValues&& o) noexcept
 		: Stash_T::Stash(std::move(o)),
 		  walk_cur(std::move(o.walk_cur)),
 		  clean_cur(std::move(o.clean_cur)),
-		  atom_end(o.atom_end.load()) { }
+		  atom_end(o.atom_end.load()),
+		  atom_claim_hint(nullptr) { }   // the hint may point at o's head; resume from ours
 
 	StashValues()
 		: walk_cur(0),
 		  clean_cur(0),
-		  atom_end(0) { }
+		  atom_end(0),
+		  atom_claim_hint(nullptr) { }
 
 	// The walk copies a value out (T = _Tp), tests it and its pointee as bool,
 	// and deletes its box; nothing else it does can throw.
@@ -988,14 +1011,28 @@ public:
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}atom_end:{}, op:{}", ctx._col(), atom_end.load(), ctx._op());
 		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
 		std::atomic<_Tp*>* ptr_atom_ptr;
+		// Resume the chain walk at the furthest node any claim has resolved (acquire: that
+		// claim's thread acquired the node from its publication, so its index is visible);
+		// a slot before it starts from the head.
+		typename Stash_T::Cursor claim;
+		auto hint = atom_claim_hint.load(std::memory_order_acquire);
+		if (hint) {
+			claim.node = hint;
+			claim.base = hint->index() * _Size;
+		}
 		try {
-			Stash_T::get(&ptr_atom_ptr, slot, true);
+			Stash_T::get(&ptr_atom_ptr, slot, true, claim);
 		} catch (...) {
 			// A new chunk or chain node failed after the claim: an unfilled claimed
 			// slot is a permanent hole, so fail fast rather than run with one.
 			stash_out_of_memory_after_claim();
 		}
 		// Nothing after the claim may throw: no trace, no allocation.
+
+		// Move the hint forward to the node this claim resolved, never back.
+		while ((hint == nullptr || hint->index() < claim.node->index()) &&
+		       !atom_claim_hint.compare_exchange_weak(hint, claim.node,
+		           std::memory_order_release, std::memory_order_acquire));
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
 		// `key`, so a walk can descend to this leaf while the slot is still a

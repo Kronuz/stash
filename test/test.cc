@@ -33,6 +33,9 @@ static unsigned long long g_overflows = 0, g_held_overflow = 0, g_held_far = 0;
 // Counts allocations, and fails the g_fail_at-th (from 1) with std::bad_alloc.
 static int g_fail_at = 0, g_allocs = 0;
 #define STASH_ALLOC_HOOK() (++g_allocs, g_fail_at && --g_fail_at == 0 ? throw std::bad_alloc() : (void)0)
+// Counts the chain nodes inserts step over to reach their chunks.
+static unsigned long long g_chain_steps = 0;
+#define STASH_CHAIN_STEP_HOOK() (++g_chain_steps)
 #include "stash.h"
 
 // The smoke test types: a single keyed level (Div=1, Mod=8) over a leaf.
@@ -431,8 +434,48 @@ static void test_alloc_failure() {
 	std::printf("stash OK: no_memory before the leaf claim stores nothing; after it, terminate\n");
 }
 
+// Inserts into one leaf walk its chain once in all: a claim resumes at the furthest node any claim
+// has reached, so n inserts into a leaf of Size-slot chunks step over about n / Size nodes. From the
+// head each, they would step over n^2 / (2 Size): a backlog of overdue keys, all filed at the floor's
+// leaf, cost quadratic time.
+static void test_claim_walk() {
+	Wheel wheel;
+	StashContext ctx(0ULL);
+	constexpr int n = 4000;   // 1000 chunks of 4
+	g_chain_steps = 0;
+	for (int i = 0; i < n; ++i) {
+		auto r = wheel.add(ctx, 3, std::make_shared<int>(i + 1));
+		assert(r == stash_result::placed);
+		(void)r;
+	}
+	if (g_chain_steps > n / 4 + 8) {
+		std::fprintf(stderr, "%d inserts into one leaf stepped over %llu chain nodes (each walked from the head)\n", n, g_chain_steps);
+		std::abort();
+	}
+	std::vector<int> got;
+	Item item;
+	ctx.op = StashContext::Operation::walk;
+	for (int guard = 0; guard < 2 * n; ++guard) {
+		ctx.begin_key = ctx.atom_first_valid_key.load();
+		ctx.end_key = 6;
+		item.reset();
+		if (!wheel.next(ctx, &item)) break;
+		if (item) got.push_back(*item);
+	}
+	bool in_order = got.size() == static_cast<size_t>(n);
+	for (int i = 0; in_order && i < n; ++i) {
+		in_order = got[i] == i + 1;
+	}
+	if (!in_order) {
+		std::fprintf(stderr, "walked %zu of %d values, or out of insert order\n", got.size(), n);
+		std::abort();
+	}
+	std::printf("stash OK: %d inserts into one leaf stepped over %llu chain nodes, walked in order\n", n, g_chain_steps);
+}
+
 int main() {
 	test_smoke();
+	test_claim_walk();
 	test_low_key_no_underflow();
 	test_high_key_span_guard();
 	test_descent_window();

@@ -73,6 +73,14 @@ computes `chunk_num = slot / _Size` and reduces `slot` to `slot % _Size`, then w
   loses to a racing producer, it deletes its own `tmp` and adopts the winner's
   node. Either way it advances to a valid `next`.
 
+A read-side caller (the walk, `clean`) passes its own cursor and resumes the hops at
+the node it last resolved. An insert into a leaf resumes at the leaf's claim hint
+(`atom_claim_hint`): the furthest node any claim into that leaf has resolved, moved
+only forward by compare-exchange, with each node carrying its place in the chain
+(`index()`, fixed before the node is published). A claim whose slot lies before the
+hint starts from the head. A node lives as long as its leaf, and an insert in flight
+holds its announce, so the leaf outlives every claim that reads its hint.
+
 Third, chunk allocation. Once on the right node, it loads `atom_chunk`. If the
 chunk is missing and `spawn` is false, it returns `StashState::ChunkEmpty`. If `spawn` is true, it allocates a chunk (null slots, or
 sentinels for the leaf) and publishes it with `atom_chunk.compare_exchange_strong`, again deleting its own allocation if it loses the race.
@@ -488,10 +496,11 @@ header at all.
 For a wheel of `L` nested slot levels:
 
 - **Insert** (`add`/`put`) is `O(L)` slot computations plus, in the worst case,
-  one chunk/node allocation per untouched level. For the leaf, `O(1)` amortized
-  append (one fetch-add). When a single chunk overflows `Size`, `Data::get`
-  walks `slot / Size` nodes, so a heavily populated single level degrades toward
-  `O(slot / Size)` node hops.
+  one chunk/node allocation per untouched level. For the leaf, `O(1)` amortized:
+  one fetch-add, and the chain hops from the leaf's claim hint, so filling a leaf
+  with `n` values steps over about `n / Size` nodes in all (a claim that falls
+  behind the hint walks from the head). A `StashSlots` level walks its own chain
+  from its head, `slot / Size` hops, bounded by `_Mod / Size`.
 - **Walk** visits each non-empty slot at most once per level; with the atomic
   key bounds it skips empty key ranges entirely, so a sparse wheel walks in time
   proportional to the live entries, not the key span.

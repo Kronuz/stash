@@ -35,6 +35,8 @@ trials; ARCHITECTURE.md, "Observing overflow"):
 - `STASH_ALLOC_HOOK()` — before every allocation stash makes (a node, a chunk, a
   child level, a value box); `test/test.cc` defines it to fail one site with
   `std::bad_alloc`.
+- `STASH_CHAIN_STEP_HOOK()` — for every chain node an insert steps over to reach
+  its slot's chunk; `test/test.cc` counts them.
 - `InFlight(ctx, key)` — RAII announce of one insert; `key()` is the key to file
   under. `add` uses it; a caller of `put` that races a walk needs one too.
 - `check(key, limit_key)` — the loop predicate: stops when `key` reaches

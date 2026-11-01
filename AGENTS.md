@@ -165,6 +165,17 @@ Read this before proposing stash for a new timer or deadline use. The README has
 - **Destruction is manual and not concurrent.** `Data::~Data` frees the node
   chain and chunks by hand; destroy a structure only when no producer or consumer
   touches it.
+- **TSan from LLVM 12 or older reports races that are not there.** With two or
+  more producers it flags a producer's access to a node, chunk or child level
+  against the constructor of the thread that installed it. The installs are
+  compare-exchanges with `release` on success and `acquire` on failure, and the
+  loser reads the winner's object through the failed CAS, which C++ makes an
+  acquire load of the winner's release RMW. LLVM 12's runtime ignores the failure
+  order (`(void)fmo` in `tsan_interface_atomic.cpp`; LLVM 13 applies it), so it
+  sees no acquire there. On clang 12, a scheduler stress with three producers gave
+  13 reports in 12 minutes, and 0 with the same three CASes at `acq_rel` on
+  success (which changes nothing for a failed CAS). Use a TSan from LLVM 13 or
+  later; CI's runs `stash_concurrent` (four producers) clean.
 
 ## Standalone vs. Xapiand
 

@@ -125,12 +125,12 @@ is given, which is what holds the depth.
 
 | Machine | Pending depth | stash | `std::mutex` + binary heap | Asio `steady_timer` |
 | --- | ---: | ---: | ---: | ---: |
-| Apple M4 Pro | 64 | **2.1** | 914 | 591 |
-| Apple M4 Pro | 1,024 | **1.4** | 120 | 144 |
-| Apple M4 Pro | 16,384 | **1.2** | 63 | 161 |
-| Intel Core i9-9980HK | 64 | **1.2** | 198 | 118 |
-| Intel Core i9-9980HK | 1,024 | **1.1** | 119 | 131 |
-| Intel Core i9-9980HK | 16,384 | **1.1** | 108 | 70 |
+| Apple M4 Pro | 64 | **2.1** | 1,210 | 1,025 |
+| Apple M4 Pro | 1,024 | **1.8** | 153 | 299 |
+| Apple M4 Pro | 16,384 | **1.8** | 71 | 263 |
+| Intel Core i9-9980HK | 64 | **1.4** | 284 | 199 |
+| Intel Core i9-9980HK | 1,024 | **1.1** | 112 | 123 |
+| Intel Core i9-9980HK | 16,384 | **1.1** | 111 | 69 |
 
 Apple clang 17 on macOS, `-O3 -DNDEBUG`; the M4 Pro has 10 performance and 4 efficiency
 cores, the i9 has 8 cores and 16 threads. The p99 of the heap and of Asio moves by a factor

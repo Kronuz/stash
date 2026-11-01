@@ -32,9 +32,9 @@ a realistic depth, which is where a scheduler actually lives.
 
 | depth | stash p99 / p999 | heap p99 / p999 | asio p99 / p999 |
 | --- | --- | --- | --- |
-| 64 | **2,125 / 3,833** | 913,541 / 4,040,854 | 591,333 / 3,791,312 |
-| 1,024 | **1,375 / 2,896** | 119,500 / 482,000 | 143,916 / 2,544,333 |
-| 16,384 | **1,208 / 2,083** | 62,771 / 226,167 | 161,354 / 2,053,583 |
+| 64 | **2,125 / 7,000** | 1,210,333 / 6,423,312 | 1,024,521 / 4,676,166 |
+| 1,024 | **1,834 / 3,208** | 153,208 / 1,042,438 | 299,417 / 3,214,979 |
+| 16,384 | **1,770 / 3,063** | 71,250 / 280,416 | 262,854 / 3,276,771 |
 
 stash holds a low-single-digit-microsecond p99 across depth; the locked heap and
 Asio spike to tens or hundreds of microseconds, and to **hundreds of microseconds
@@ -49,11 +49,11 @@ Per-thread detail (p50 / p99 / p999, ns):
 
 | | depth 64 | depth 1,024 | depth 16,384 |
 | --- | --- | --- | --- |
-| stash, 1 thread | 84 / 500 / 771 | 83 / 416 / 625 | 42 / 292 / 708 |
-| stash, 4 threads | 292 / 1,000 / 1,416 | 271 / 854 / 1,125 | 250 / 834 / 1,125 |
-| stash, 14 threads | 625 / 2,125 / 3,833 | 458 / 1,375 / 2,896 | 417 / 1,208 / 2,083 |
-| heap, 14 threads | 10,958 / 913,541 / 4,040,854 | 83 / 119,500 / 482,000 | 42 / 62,771 / 226,167 |
-| asio, 14 threads | 13,249 / 591,333 / 3,791,312 | 5,063 / 143,916 / 2,544,333 | 1,416 / 161,354 / 2,053,583 |
+| stash, 1 thread | 84 / 500 / 1,062 | 83 / 375 / 688 | 42 / 291 / 584 |
+| stash, 4 threads | 354 / 1,084 / 1,771 | 312 / 917 / 1,250 | 292 / 875 / 1,188 |
+| stash, 14 threads | 750 / 2,125 / 7,000 | 688 / 1,834 / 3,208 | 667 / 1,770 / 3,063 |
+| heap, 14 threads | 12,562 / 1,210,333 / 6,423,312 | 84 / 153,208 / 1,042,438 | 42 / 71,250 / 280,416 |
+| asio, 14 threads | 9,646 / 1,024,521 / 4,676,166 | 4,770 / 299,417 / 3,214,979 | 3,104 / 262,854 / 3,276,771 |
 
 (The heap's low p50 with a huge p99 is the lock exactly: most acquisitions are
 cheap, a few wait a quantum. That spread is the tail story in one row.)

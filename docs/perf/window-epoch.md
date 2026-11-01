@@ -1,5 +1,7 @@
 # Windowed announce board with far-insert epochs
 
+> Paths under `.scratch/` name local scratch files (probes, logs, builds) that are not part of the repository.
+
 Branch `perf/window-epoch` from main `a41b2d0`. Kept by the owner with a fixed width; for review,
 not merged. The first round below measured the adaptive variant (170e1d8); "Fixed width" at the
 end re-measures what the branch now carries.

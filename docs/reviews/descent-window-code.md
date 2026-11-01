@@ -1,5 +1,7 @@
 # Code review: fix/descent-window (the in-flight announce)
 
+> Paths under `.scratch/` name local scratch files (probes, logs, builds) that are not part of the repository.
+
 Branch `fix/descent-window`, tip `9e2ebd8` (commits `bd8c2c6`, `d7dc92b`, `9e2ebd8`) from
 main `2908b48`, matching `origin/fix/descent-window`. Reviewed from the detached worktree
 a detached worktree of that branch on macOS x86_64 (i9-9980HK, 16 logical CPUs),

@@ -19,8 +19,8 @@ timer queue that many threads arm and one thread fires.
 
 - **Producers never block each other.** Every insert is an atomic fetch-add or a
   compare-and-swap; there is no lock to queue behind.
-- **Flat tail under contention.** With 14 threads arming, the p99 insert stays under
-  2 µs at every depth measured (see [Performance](#-performance)).
+- **Flat tail under contention.** With 14 threads arming, the p99 insert stays at
+  about 1 to 2 µs at every depth measured (see [Performance](#-performance)).
 - **Memory follows what is live.** Levels and chunks are allocated on first use, so a
   24-hour wheel at 1 ms resolution costs only the slots that hold something.
 - **Answers "what is due now?"** A walk drains every value below a key in key order,
@@ -114,15 +114,20 @@ horizon, memory), which timers fit, and what to use instead.
 ## ⚡ Performance
 
 Insert (arm) latency at a bounded pending depth, 14 threads arming and one draining,
-p99 in µs ([bench/RESULTS.md](bench/RESULTS.md)):
+p99 in µs, the median of four runs of `bench_steady` ([bench/RESULTS.md](bench/RESULTS.md)):
 
-| Pending depth | stash | `std::mutex` + binary heap | Asio 1.30.2 `steady_timer` |
-| ---: | ---: | ---: | ---: |
-| 64 | **1.6** | 1,214 | 1,249 |
-| 1,024 | **1.4** | 151 | 188 |
-| 16,384 | **1.8** | 65 | 182 |
+| Machine | Pending depth | stash | `std::mutex` + binary heap | Asio 1.30.2 `steady_timer` |
+| --- | ---: | ---: | ---: | ---: |
+| Apple M4 Pro | 64 | **2.1** | 914 | 591 |
+| Apple M4 Pro | 1,024 | **1.4** | 120 | 144 |
+| Apple M4 Pro | 16,384 | **1.2** | 63 | 161 |
+| Intel Core i9-9980HK | 64 | **1.2** | 198 | 118 |
+| Intel Core i9-9980HK | 1,024 | **1.1** | 119 | 131 |
+| Intel Core i9-9980HK | 16,384 | **1.1** | 108 | 70 |
 
-Apple M4 Pro (10 performance and 4 efficiency cores), AppleClang 17, `-O3 -DNDEBUG`:
+Apple clang 17 on macOS, `-O3 -DNDEBUG`; the M4 Pro has 10 performance and 4 efficiency
+cores, the i9 has 8 cores and 16 threads. The p99 of the heap and of Asio moves by a factor
+of two between runs, because a lock makes producers queue behind a descheduled holder.
 
 ```sh
 cmake -S bench -B build-bench -DCMAKE_BUILD_TYPE=Release

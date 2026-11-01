@@ -121,7 +121,7 @@ Breaking one of these produces silent loss or a race, not a compile error.
 
 ## When to use stash, and when not
 
-Read this before proposing stash for a new timer or deadline use. The README has the same section for users; this one adds what a change would have to respect.
+Read this before proposing stash for a new timer or deadline use. The README's "When to use it" and ARCHITECTURE.md's "Limits and fit" cover it for users; this one adds what a change would have to respect.
 
 - **The shape it is best at.** Many producer threads `add` deadline-tagged items, one thread walks what is due, and most items fire instead of being cancelled. Deferred logging and per-key debouncing are that shape.
 - **Resolution.** The finest `_Div` (1 ms on Xapiand's stack). The walk drains a finest slot whole, so an item can fire up to one slot early, and items in a slot fire in arrival order.

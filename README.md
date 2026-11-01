@@ -113,10 +113,17 @@ horizon, memory), which timers fit, and what to use instead.
 
 ## ⚡ Performance
 
-Insert (arm) latency at a bounded pending depth, 14 threads arming and one draining,
-p99 in µs, the median of four runs of `bench_steady` ([bench/RESULTS.md](bench/RESULTS.md)):
+Time to arm one timer (the insert), p99 in µs, while 14 threads arm timers and one thread fires
+the due ones: the median of four runs of `bench_steady` ([bench/RESULTS.md](bench/RESULTS.md)).
+Each timer is due 0 to 2 ms ahead, and the benchmark holds the number of timers armed and not yet
+fired (the pending depth) near the value in the second column. Three stores take the same load.
+*stash* is this library's wheel in Xapiand's four-level geometry. *`std::mutex` + binary heap* is a
+`std::priority_queue` behind one `std::mutex`. *Asio `steady_timer`* is an `asio::steady_timer`
+armed on one `io_context` that another thread runs, from
+[Asio 1.30.2](https://github.com/chriskohlhoff/asio/tree/asio-1-30-2). Each fires every timer it
+is given, which is what holds the depth.
 
-| Machine | Pending depth | stash | `std::mutex` + binary heap | Asio 1.30.2 `steady_timer` |
+| Machine | Pending depth | stash | `std::mutex` + binary heap | Asio `steady_timer` |
 | --- | ---: | ---: | ---: | ---: |
 | Apple M4 Pro | 64 | **2.1** | 914 | 591 |
 | Apple M4 Pro | 1,024 | **1.4** | 120 | 144 |

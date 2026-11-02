@@ -1,24 +1,30 @@
 # Status: perf/claim-hint-publish
 
-> Status: CURRENT (2026-11-02) Settles Kronuz/stash#1: does main (8fa5d2a, `claim_hint_chunks` = 8)
-> still cost depth-64 p99 against the code before the hint (START 2e2b75f). Results in
-> `docs/perf/claim-hint-publish.md`.
+> Status: CURRENT (2026-11-02) Settles Kronuz/stash#1. Results: `docs/perf/claim-hint-publish.md`.
 
 ## Done criteria
 
-- A strict interleaved A/B (START, HEAD, START again as the A/A control) on `bench_steady`,
-  `bench_scheduler`, `bench_bursty`, `bench_structures`, with p50 and p99 per row.
-- If HEAD is inside the A/A band at depth 64: README depth-64 cells from the run, comment on #1,
-  close it. Otherwise at most five publish experiments; a win lands with TSan and ASan clean,
-  the existing tests, a mutant, CI green.
+- A strict interleaved A/B (START 2e2b75f, main 8fa5d2a, START again as the A/A control) on the four
+  benches with p50 and p99 per row.
+- A publish whose depth-64 p99 is at START on the i9, with TSan and ASan clean, the existing tests,
+  mutants, and the chain-walk rows no more than 3% slower than main.
 
 ## State
 
-Starting. Host: i9-9980HK, Apple clang 17, macOS. The M4 Pro is not reachable from this host, so
-its rows are not remeasured here.
+Main costs the i9 5% (t=4) and 6% (t=14) at depth-64 p99 (84 rounds; A/A 1.00). The candidate (one
+release store per chunk after the fill, no threshold) is at START: 0.989 / 0.995. Five experiments
+recorded; four losers removed. The M4 Pro and Linux are not measured; the lead lands the branch on
+main, closes the issue and measures the other platforms.
 
 ## Done
 
+- Ledger and plan: stash-wt/claim-hint-publish commits 6ef4585, 012f373.
+- Candidate with its test and the results note: see `git log perf/claim-hint-publish`.
+
 ## Next
 
+- The lead: land perf/claim-hint-publish, close stash#1, measure the M4 Pro and Linux once.
+
 ## Blocked on
+
+Nothing.

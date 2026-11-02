@@ -14,35 +14,50 @@
 
 ## State
 
-Candidate 528ccef pushed; strict holds queued on the M4 Pro and the i9 (one each, building
-inside). CI dispatched on the branch (run 41367951740).
+Fallback landed in place of the fix (issue Kronuz/stash#1): the store-published hint (528ccef) did not reach START on
+the M4 Pro, so a leaf's first eight chunks run START's code again (b0fce1c) and the hint works
+as in 78a18f3 past them. CI green on the branch before landing; GitHub issue filed with the
+findings.
 
 ## Done
 
-- Variants (`bench_steady`'s stash rows at depth 64 and 1 024, same code, screen on the M1 Pro
-  under a light hold, 6 and 12 rounds): HEAD, no compare-exchange for a claim that resolved the
-  head (`nofirst`), the publish as a relaxed store (`relaxed`) and as a release store (`rel`),
-  START with HEAD's sizes (`pad`), and candidates. Too noisy at t=4 to rank (A/A 0.87 to 1.08,
-  ranges 0.5 to 1.7); at t=14 HEAD 0.918, `relaxed` 0.957, the store-based candidate 0.969.
-  The M4 and i9 holds repeat the variants.
-- 528ccef: claims in the head's chunk read and publish nothing; a claim past the hint publishes
-  with a release store. `STASH_CLAIM_HINT_HOOK`; `test_claim_walk` counts reads (n - 4) and
-  publishes (n / 4 - 1). Revert check (HEAD's logic with the hooks at its load and successful
-  compare-exchange): aborts, "read the hint 4 times and published it 1 times" in the head's
-  chunk. Mutants caught: `>` to `>=` in the publish test (published 4 times), the load guard
-  removed (read 4 times).
-- `test/concurrent.cc`: every id must fire exactly once; depth cap and key band arguments; CTest
-  `stash_claims_d64` (14 producers, depth 64, 2 ms band). Fails on a claim made by load and
-  store instead of fetch-add, and on a hint base one chunk too far (lost ids, 2 runs each).
-- M1 Pro, Apple clang 21: ctest 4/4; TSan `test.cc`, `concurrent.cc` with CI's arguments x3 and
-  at depth 64 x3, 0 reports; ASan+UBSan `test.cc`, `concurrent.cc` CI x1 and depth 64 x2,
-  clean; every id fired once.
+- One strict hold per machine (M4 Pro 16:54-17:03, i9 16:47-16:55; builds inside;
+  `bench_steady 250` START/CAND/HEAD/START interleaved, 4 rounds M4, 3 i9). Named rows, p99 ns,
+  START / HEAD / CAND: M4 t=4 979 / 1125 / 1041.5 (CAND 0.940), t=14 1771 / 1979 / 1875
+  (0.934); i9 t=4 714 / 750 / 723 (0.988), t=14 1280 / 1365 / 1269 (1.009). CAND misses the
+  bar on the M4.
+- Variants (stash rows of `bench_steady` at depth 64 and 1 024, same code, 3 rounds, ratio
+  against START at t=4 / t=14 p99). M4: HEAD 0.919 / 0.979, no first-claim CAS 0.920 / 0.941,
+  release store 0.919 / 0.980, relaxed store 1.000 / 1.022, START + 16 bytes 1.000 / 1.000,
+  CAND 0.959 / 0.980. i9: HEAD 0.973 / 0.933, no first-claim CAS 0.982 / 0.913, relaxed
+  0.960 / 0.986, release store 1.015 / 0.991, START + 16 bytes 0.992 / 0.987, CAND 0.976 /
+  0.994. Cause: the ordered write that publishes the hint (a CAS, or on the M4 a release
+  store too); not the first claim, not the size. A relaxed store does not order the node's
+  index, so it is not a fix.
+- HEAD vs CAND, other benches (ab_compare, 3 rounds; i9 structures 2): geomeans M4 1.051
+  scheduler, 1.047 bursty, 1.019 structures; i9 1.006, 0.981, 1.019; stash rows below 0.97
+  sit inside the spread the control rows show (heap, Asio, multimap at 0.85 to 0.96).
+- b0fce1c (fallback): `claim_hint_chunks` = 8; tests and checks below.
+- 528ccef, superseded by b0fce1c: head chunk skips the hint, release-store publish.
+- `test_claim_walk`: no hint access in the first 32 slots, n - 32 reads, n / 4 - 8 publishes,
+  at most n / 4 + 120 steps (1 111). Revert check (78a18f3's logic, hooks at its load and
+  successful CAS): aborts, 32 reads and 8 publishes in the first chunks. Mutant caught: the
+  threshold `>=` to `>` (3 967 reads, want 3 968).
+- `test/concurrent.cc`: every id fires exactly once; depth cap and key band; CTest
+  `stash_claims_d64`. Fails on a claim by load and store instead of fetch-add, and on a hint
+  base one chunk too far (lost ids, 2 runs each).
+- M1 Pro, Apple clang 21, for both 528ccef and b0fce1c: ctest 4/4; TSan `test.cc`,
+  `concurrent.cc` CI args x3, depth 64 x3: 0 reports; ASan+UBSan clean; every id fired once.
+- The fallback was not timed in a strict hold (one per machine, spent on the candidate). Its
+  depth-64 path is START's code (no hint access in the first 80 slots, which the test pins)
+  with HEAD's layout, which both holds measured at START (1.000 / 1.000 M4, 0.992 / 0.987
+  i9). An M1 Pro light screen (13 rounds) has it with HEAD on the depth-1 024 rows; its t=4
+  rows there are noise (A/A ranges 0.4 to 1.6).
 
 ## Next
 
-- Read the holds; land on main if the rows pass, else the fallback (brief: START's behavior on
-  that path, an issue with what was learned).
-- CHANGELOG, README Performance rows that move, a lesson in campaign/LESSONS.md.
+- A strict A/B of b0fce1c against START and HEAD on both machines, all four benches, when a
+  hold is free, and the README depth-64 cells from it.
 
 ## Blocked on
 

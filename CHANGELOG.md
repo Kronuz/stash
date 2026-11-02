@@ -8,24 +8,28 @@ in [STRAND_FIX.md](STRAND_FIX.md) and `docs/perf/`.
 
 ### Changed
 
-- An insert into a leaf's first eight chunks (`claim_hint_chunks`, 80 values at `Size` 10)
-  walks its chain from the head again, as before 2026-10-31, and neither reads nor publishes
-  the claim hint; past them it resumes at the hint as before. The hint made every insert
-  read it and every insert that reached a new chunk publish it with a compare-exchange on the
-  leaf's contended line, and `bench_steady`'s depth-64 rows (about 64 values a leaf) paid for
-  it at p99: with 4 and 14 producers, 979 and 1 771 ns before the hint, 1 125 and 1 979 ns
-  with it (Apple M4 Pro); 714 and 1 280 ns before, 750 and 1 365 ns with it (Intel
-  i9-9980HK); `bench_steady 250`, START and HEAD interleaved in one strict hold, 4 and 3
-  rounds. Those leaves now run the code they ran before the hint. A leaf of more values walks
-  `n / Size + 28 Size` nodes in all (`test_claim_walk`: 1 111 steps for 4 000 inserts into
-  chunks of 4, 1 998 000 from the head each). Variants of the stash rows, same hold, each
-  against START: the hint without the compare-exchange on a leaf's first claim stays slow
-  (M4 0.920 and 0.941), START with the hint's 16 bytes is as fast as START (1.000 and
-  1.000), a release store instead of the compare-exchange stays slow on the M4 (0.919 and
-  0.980), and only a relaxed store, which would not order the node's index, is as fast as
-  START (1.000 and 1.022). Skipping the hint in the head's chunk alone and publishing it with
-  a release store gave 0.940 and 0.934 on the M4 Pro and 0.988 and 1.009 on the i9.
-  Results and orders are unchanged.
+- An insert into a leaf's first eight chunks (`claim_hint_chunks`, 80 values at `Size`
+  10) walks its chain from the head again, as before 2026-10-31, and neither reads nor
+  publishes the claim hint; past them it resumes at the hint as before. The hint had every
+  insert read it and every insert that reached a new chunk publish it with a
+  compare-exchange on the leaf's contended line, and `bench_steady`'s depth-64 rows (about
+  64 values a leaf) paid for it at p99. With 4 and 14 producers: 979 and 1 771 ns before
+  the hint, 1 125 and 1 979 ns with it (Apple M4 Pro, 4 rounds); 714 and 1 280 ns before,
+  750 and 1 365 ns with it (Intel i9-9980HK, 3 rounds); `bench_steady 250`, both builds
+  interleaved in one strict hold per machine. Those leaves now run the code they ran before
+  the hint; leaves of more values keep the linear walk, `n / Size + 28 Size` nodes for `n`
+  values (`test_claim_walk`: 1 111 steps for 4 000 inserts into chunks of 4, against
+  1 998 000 from the head each). Results and orders are unchanged.
+- The cause, from variants of `bench_steady`'s stash rows in the same holds (p99 ratio
+  against the code before the hint, 4 and 14 producers, M4 Pro): the hint as it was,
+  0.919 and 0.979; without the compare-exchange on a leaf's first claim, 0.920 and 0.941;
+  with a release store instead of the compare-exchange, 0.919 and 0.980; with a relaxed
+  store, 1.000 and 1.022, but a relaxed store does not order the node's index for the
+  reader; the code before the hint with the hint's 16 bytes added, 1.000 and 1.000. The
+  ordered write that publishes the hint is the cost, not the first claim or the size. A
+  candidate that skipped the hint in the head's chunk alone and published it with a release
+  store measured 0.940 and 0.934 on the M4 Pro (0.988 and 1.009 on the i9) and was not
+  kept.
 
 ### Added
 

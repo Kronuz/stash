@@ -36,6 +36,9 @@ static int g_fail_at = 0, g_allocs = 0;
 // Counts the chain nodes inserts step over to reach their chunks.
 static unsigned long long g_chain_steps = 0;
 #define STASH_CHAIN_STEP_HOOK() (++g_chain_steps)
+// Counts the reads and publishes of a leaf's claim hint.
+static unsigned long long g_hint_reads = 0, g_hint_publishes = 0;
+#define STASH_CLAIM_HINT_HOOK(publish) (++((publish) ? g_hint_publishes : g_hint_reads))
 #include "stash.h"
 
 // The smoke test types: a single keyed level (Div=1, Mod=8) over a leaf.
@@ -437,19 +440,30 @@ static void test_alloc_failure() {
 // Inserts into one leaf walk its chain once in all: a claim resumes at the furthest node any claim
 // has reached, so n inserts into a leaf of Size-slot chunks step over about n / Size nodes. From the
 // head each, they would step over n^2 / (2 Size): a backlog of overdue keys, all filed at the floor's
-// leaf, cost quadratic time.
+// leaf, cost quadratic time. Claims in the head's chunk neither read nor publish the hint
+// (bench_steady's depth-64 leaves fill a few chunks, and an atomic on the leaf's line per claim
+// there cost its p99), and one claim publishes each node past the head.
 static void test_claim_walk() {
 	Wheel wheel;
 	StashContext ctx(0ULL);
 	constexpr int n = 4000;   // 1000 chunks of 4
-	g_chain_steps = 0;
+	g_chain_steps = g_hint_reads = g_hint_publishes = 0;
 	for (int i = 0; i < n; ++i) {
 		auto r = wheel.add(ctx, 3, std::make_shared<int>(i + 1));
 		assert(r == stash_result::placed);
 		(void)r;
+		if (i == 3 && (g_hint_reads || g_hint_publishes)) {
+			std::fprintf(stderr, "claims in the head's chunk read the hint %llu times and published it %llu times\n", g_hint_reads, g_hint_publishes);
+			std::abort();
+		}
 	}
 	if (g_chain_steps > n / 4 + 8) {
 		std::fprintf(stderr, "%d inserts into one leaf stepped over %llu chain nodes (each walked from the head)\n", n, g_chain_steps);
+		std::abort();
+	}
+	if (g_hint_reads != n - 4 || g_hint_publishes != n / 4 - 1) {
+		std::fprintf(stderr, "%d inserts into one leaf read the hint %llu times (want %d) and published it %llu times (want %d)\n",
+		             n, g_hint_reads, n - 4, g_hint_publishes, n / 4 - 1);
 		std::abort();
 	}
 	std::vector<int> got;
@@ -470,7 +484,7 @@ static void test_claim_walk() {
 		std::fprintf(stderr, "walked %zu of %d values, or out of insert order\n", got.size(), n);
 		std::abort();
 	}
-	std::printf("stash OK: %d inserts into one leaf stepped over %llu chain nodes, walked in order\n", n, g_chain_steps);
+	std::printf("stash OK: %d inserts into one leaf stepped over %llu chain nodes, published the hint %llu times, walked in order\n", n, g_chain_steps, g_hint_publishes);
 }
 
 int main() {

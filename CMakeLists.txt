@@ -26,6 +26,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_link_libraries(stash_concurrent PRIVATE stash Threads::Threads)
   add_test(NAME stash_concurrent COMMAND stash_concurrent 4 2.0 32 0 0)
   set_tests_properties(stash_concurrent PROPERTIES TIMEOUT 60)
+  # Fourteen producers held at 64 pending tasks over a 2 ms band (bench_steady's
+  # depth-64 rows): inserts race for claims several chunks into the same leaves,
+  # and every id must fire exactly once.
+  add_test(NAME stash_claims_d64 COMMAND stash_concurrent 14 2.0 32 0 0 64 2)
+  set_tests_properties(stash_claims_d64 PROPERTIES TIMEOUT 60)
 
   # A runnable tour of the data structure (not a test): build & run
   # ./build/stash_demo. Header-only like the test, so it just links the

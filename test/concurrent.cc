@@ -2,8 +2,14 @@
 //
 // Many producer threads add() tasks in a narrow band near now() while one
 // consumer walks (drains+fires) and cleans. Every added task must fire exactly
-// once (count + XOR); a leaf dropped while still in use shows up as loss, and a
-// reclaim racing a live producer shows up as a use-after-free under ASan.
+// once (each id checked, plus count and XOR); a leaf dropped while still in use
+// or a claimed slot left unfilled shows up as a lost id, two claims resolving one
+// slot or a value taken twice as a lost or duplicated id, and a reclaim racing a
+// live producer as a use-after-free under ASan.
+//
+// With a depth cap (DEPTH > 0) producers stop adding while DEPTH tasks are
+// pending, as bench_steady holds its depth: with a 2 ms band at depth 64 most
+// inserts share a few leaves, several chunks deep, and race for their claims.
 //
 // The load-bearing invariant here is a property of every hierarchical timer
 // wheel, not of this structure specifically: the consumer must complete a clean
@@ -35,6 +41,7 @@
 //   + -fsanitize=address : use-after-free / heap corruption  (Homebrew LLVM)
 //   + -fsanitize=thread  : data races
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -118,6 +125,10 @@ int main(int argc, char** argv) {
 	// Base lead added to every key (ms). 0 = leading edge: tasks come due while
 	// their own insert is still descending, the hardest case for the accounting.
 	unsigned long long lead = (argc > 5 ? (unsigned long long)atoll(argv[5]) : 0) * MS;
+	// Pending tasks at most (0: no cap), and the key band (ms) after the lead.
+	long depth_cap = argc > 6 ? atol(argv[6]) : 0;
+	unsigned long long band = (argc > 7 ? (unsigned long long)atoll(argv[7]) : HORIZON / MS / 8) * MS;
+	if (band > HORIZON) band = HORIZON;
 
 	// Unbuffered output (so nothing is lost on a crash) + a watchdog that turns an
 	// infinite loop (structural corruption) into a reported FAIL instead of a hang.
@@ -146,26 +157,44 @@ int main(int argc, char** argv) {
 	unsigned long long drain_ns = 0;               // how long the final drain took
 	std::atomic<int> phase{0};                   // 0=run, 1=draining
 	std::atomic<bool> producers_done{false};
+	std::atomic<long> live{0};                   // pending tasks, for the depth cap
+	std::vector<std::vector<uint64_t>> unplaced(nproducers);   // ids add() refused, per producer
+	std::vector<uint8_t> fired_ids;              // consumer-only: times each id fired
 #ifdef TRACK_MEM
 	std::atomic<long long> peak_live{0};
 #endif
 
 	auto producer = [&](int tid) {
 		std::mt19937_64 rng(0x9E3779B97F4A7C15ULL ^ (uint64_t)tid);
-		std::uniform_int_distribution<unsigned long long> jitter(0, HORIZON / 8);   // narrow key band (8ms), far inside one revolution
+		std::uniform_int_distribution<unsigned long long> jitter(0, band);   // narrow key band (8ms default), far inside one revolution
 		while (phase.load(std::memory_order_acquire) == 0) {
+			if (depth_cap) {
+				while (live.load(std::memory_order_acquire) >= depth_cap && phase.load(std::memory_order_acquire) == 0) {
+					std::this_thread::yield();
+				}
+				if (phase.load(std::memory_order_acquire) != 0) break;
+			}
 			uint64_t id = uid_gen.fetch_add(1, std::memory_order_relaxed);
 			auto t = std::make_shared<Task>(id);
 			unsigned long long key = now_ns() + lead + jitter(rng);
 			if (wheel->add(ctx, key, t) == stash_result::placed) {
 				added_count.fetch_add(1, std::memory_order_relaxed);
 				added_xor.fetch_xor(id, std::memory_order_relaxed);
-			}   // else past the horizon (or no memory): not inserted, not accounted
+				live.fetch_add(1, std::memory_order_acq_rel);
+			} else {   // past the horizon (or no memory): not inserted, not accounted
+				unplaced[tid].push_back(id);
+			}
 			if (pause_ns) { auto u = now_ns() + pause_ns; while (now_ns() < u) {} }
 		}
 	};
 
-	auto fire = [&](const TaskPtr& t) { ++fired_count; fired_xor ^= t->id; };
+	auto fire = [&](const TaskPtr& t) {
+		++fired_count;
+		fired_xor ^= t->id;
+		if (t->id >= fired_ids.size()) fired_ids.resize(std::max<size_t>(t->id + 1, 2 * fired_ids.size()));
+		if (fired_ids[t->id] < 255) ++fired_ids[t->id];
+		live.fetch_sub(1, std::memory_order_acq_rel);
+	};
 
 	auto consumer = [&]() {
 		TaskPtr out;
@@ -224,8 +253,22 @@ int main(int argc, char** argv) {
 	cons.join();
 
 	uint64_t added = added_count.load(), axor = added_xor.load();
-	bool ok = (fired_count == added) && (fired_xor == axor);
-	printf("producers=%d  seconds=%.1f  margin=%llums  lead=%llums  final drain=%llums\n", nproducers, seconds, margin / MS, lead / MS, drain_ns / MS);
+	// Every id fetched was attempted: each placed one must fire exactly once, each refused one never.
+	std::vector<uint8_t> want(uid_gen.load(), 1);
+	for (auto& ids : unplaced) for (auto id : ids) want[id] = 0;
+	uint64_t lost = 0, duplicated = 0, spurious = 0;
+	for (uint64_t id = 0; id < want.size(); ++id) {
+		unsigned got = id < fired_ids.size() ? fired_ids[id] : 0;
+		if (got == want[id]) continue;
+		if (got > want[id] && want[id]) ++duplicated; else if (got > want[id]) ++spurious; else ++lost;
+		if (lost + duplicated + spurious <= 5) printf("  id %llu fired %u times, want %u\n", (unsigned long long)id, got, (unsigned)want[id]);
+	}
+	if (fired_ids.size() > want.size()) {
+		for (uint64_t id = want.size(); id < fired_ids.size(); ++id) spurious += fired_ids[id] != 0;
+	}
+	bool ok = (fired_count == added) && (fired_xor == axor) && !lost && !duplicated && !spurious;
+	printf("producers=%d  seconds=%.1f  margin=%llums  lead=%llums  depth cap=%ld  band=%llums  final drain=%llums\n", nproducers, seconds, margin / MS, lead / MS, depth_cap, band / MS, drain_ns / MS);
+	printf("  ids: lost=%llu duplicated=%llu spurious=%llu\n", (unsigned long long)lost, (unsigned long long)duplicated, (unsigned long long)spurious);
 	printf("  added=%llu fired=%llu  xor(add)=%016llx xor(fire)=%016llx\n",
 	       (unsigned long long)added, (unsigned long long)fired_count,
 	       (unsigned long long)axor, (unsigned long long)fired_xor);

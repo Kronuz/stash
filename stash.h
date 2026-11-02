@@ -96,6 +96,12 @@ inline T* stash_reserved() noexcept {
 #define STASH_CHAIN_STEP_HOOK()
 #endif
 
+// Runs for every read (false) and publish (true) of a leaf's claim hint, a no-op unless
+// defined before this header; a test counts that claims in a leaf's head chunk touch neither.
+#ifndef STASH_CLAIM_HINT_HOOK
+#define STASH_CLAIM_HINT_HOOK(publish)
+#endif
+
 // Per-walk-start hold statistics, a no-op unless defined before this header:
 // the board scan capped first_valid lower because of the overflow counter
 // (`overflow`) or a previous-epoch far insert still in flight (`far_pin`).
@@ -858,10 +864,11 @@ class StashValues : public Stash<_Tp, _Size, true> {
 	                                 // or drained (null); the walk reads which directly.
 	typename Stash_T::Cursor walk_cursor;    // consumer scan resume points (single
 	typename Stash_T::Cursor clean_cursor;   // consumer; each tracks its own cur)
-	// Producers: the furthest chain node a claim has resolved. A claim resumes its walk there
-	// when its slot lies at or past it, so filling a leaf of n values walks O(n) nodes in all,
-	// not O(n^2). A node lives as long as the leaf, and a claim in flight holds its announce,
-	// so the leaf (and the node) outlive every claim that reads the hint.
+	// Producers: a chain node past the head that a claim has resolved, the furthest unless a
+	// race stored an older one last; null means the head. A claim past the head's chunk resumes
+	// its walk there when its slot lies at or past it, so filling a leaf of n values walks O(n)
+	// nodes in all, not O(n^2). A node lives as long as the leaf, and a claim in flight holds its
+	// announce, so the leaf (and the node) outlive every claim that reads the hint.
 	std::atomic<typename Stash_T::Data*> atom_claim_hint;
 
 public:
@@ -1011,14 +1018,18 @@ public:
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}atom_end:{}, op:{}", ctx._col(), atom_end.load(), ctx._op());
 		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
 		std::atomic<_Tp*>* ptr_atom_ptr;
-		// Resume the chain walk at the furthest node any claim has resolved (acquire: that
-		// claim's thread acquired the node from its publication, so its index is visible);
-		// a slot before it starts from the head.
+		// A slot in the head's chunk needs no walk and reads no hint. Past it, resume the walk
+		// at the hint (acquire: its publisher acquired the node from its publication, so its
+		// index is visible); a slot before the hint starts from the head.
 		typename Stash_T::Cursor claim;
-		auto hint = atom_claim_hint.load(std::memory_order_acquire);
-		if (hint) {
-			claim.node = hint;
-			claim.base = hint->index() * _Size;
+		typename Stash_T::Data* hint = nullptr;
+		if (slot >= _Size) {
+			STASH_CLAIM_HINT_HOOK(false);
+			hint = atom_claim_hint.load(std::memory_order_acquire);
+			if (hint) {
+				claim.node = hint;
+				claim.base = hint->index() * _Size;
+			}
 		}
 		try {
 			Stash_T::get(&ptr_atom_ptr, slot, true, claim);
@@ -1029,10 +1040,15 @@ public:
 		}
 		// Nothing after the claim may throw: no trace, no allocation.
 
-		// Move the hint forward to the node this claim resolved, never back.
-		while ((hint == nullptr || hint->index() < claim.node->index()) &&
-		       !atom_claim_hint.compare_exchange_weak(hint, claim.node,
-		           std::memory_order_release, std::memory_order_acquire));
+		// A claim that resolved a node past the hint it read (a null hint is the head) publishes
+		// that node with a store, not a compare-exchange: an RMW here waits for the leaf's line,
+		// which every producer's claim contends. A racing claim may store an older node after a
+		// newer one; that costs later claims a few steps, never a wrong slot (release: a reader
+		// that acquires the node sees its index).
+		if (claim.node->index() > (hint ? hint->index() : 0)) {
+			STASH_CLAIM_HINT_HOOK(true);
+			atom_claim_hint.store(claim.node, std::memory_order_release);
+		}
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
 		// `key`, so a walk can descend to this leaf while the slot is still a

@@ -6,6 +6,22 @@ in [STRAND_FIX.md](STRAND_FIX.md) and `docs/perf/`.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#stash) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-02
+
+### Changed
+
+- A claim past a leaf's head chunk reads the claim hint, and the claim of a chunk's first
+  slot publishes its node with one release store after the value is in place. The
+  compare-exchange before the fill and the eight-chunk threshold (`claim_hint_chunks`) are
+  gone. `bench_steady` depth-64 p99 at 4 and 14 producers (Intel i9-9980HK, 84 interleaved
+  strict rounds, medians): 748 and 1 227 ns before the hint, 781 and 1 304 ns on
+  2026-11-01, 763 and 1 238 ns now (0.989 and 0.995 of the code before the hint, where
+  START against itself reads 0.993 and 0.999). The other benches' stash rows are above or
+  at the 2026-11-01 code (geomeans 1.011 to 1.077). The Apple M4 Pro and Linux are not yet
+  measured on this version. `test_claim_walk` counts `n / Size + 8` chain steps for `n`
+  inserts. Results and orders are unchanged. See `docs/perf/claim-hint-publish.md` and
+  Kronuz/stash#1.
+
 ## 2026-11-01
 
 ### Changed

@@ -18,8 +18,8 @@ main, closes the issue and measures the other platforms.
 
 ## Done
 
-- Ledger and plan: stash-wt/claim-hint-publish commits 6ef4585, 012f373.
-- Candidate with its test and the results note: see `git log perf/claim-hint-publish`.
+- Ledger and plan: stash:6ef4585, stash:012f373. Candidate and test: stash:de4c3d5. Results: stash:b78f43e.
+- 
 
 ## Next
 

@@ -864,18 +864,12 @@ class StashValues : public Stash<_Tp, _Size, true> {
 	                                 // or drained (null); the walk reads which directly.
 	typename Stash_T::Cursor walk_cursor;    // consumer scan resume points (single
 	typename Stash_T::Cursor clean_cursor;   // consumer; each tracks its own cur)
-	// Producers: the furthest chain node a claim past the first claim_hint_chunks chunks has
-	// resolved. Such a claim resumes its walk there when its slot lies at or past it, so
-	// filling a leaf of n values walks O(n) nodes in all, not O(n^2). A node lives as long as
-	// the leaf, and a claim in flight holds its announce, so the leaf (and the node) outlive
-	// every claim that reads the hint.
+	// Producers: a chain node past the head that a claim resolved, normally the furthest (null
+	// is the head). A claim past the head's chunk resumes its walk there when its slot lies at
+	// or past it, so filling a leaf of n values walks O(n) nodes in all, not O(n^2). A node
+	// lives as long as the leaf, and a claim in flight holds its announce, so the leaf (and the
+	// node) outlive every claim that reads or publishes the hint.
 	std::atomic<typename Stash_T::Data*> atom_claim_hint;
-	// Claims into a leaf's first claim_hint_chunks chunks walk from the head (at most seven
-	// hops) and never touch the hint: publishing it, by compare-exchange or by a release store,
-	// on the leaf's line, which every claim contends, cost bench_steady's depth-64 rows 4% to
-	// 12% at p99. Those leaves hold about 120 values (a finest slot drains whole), so a third of
-	// their claims still land past these chunks; see CHANGELOG 2026-11-01 and stash#1.
-	static constexpr size_t claim_hint_chunks = 8;
 
 public:
 	StashValues(StashValues&& o) noexcept
@@ -1024,11 +1018,10 @@ public:
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}atom_end:{}, op:{}", ctx._col(), atom_end.load(), ctx._op());
 		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
 		std::atomic<_Tp*>* ptr_atom_ptr;
-		// A slot in the leaf's first claim_hint_chunks chunks walks from the head and leaves
-		// the hint alone. Past them, resume the walk at the furthest node any claim has
-		// resolved (acquire: that claim's thread acquired the node from its publication, so its
-		// index is visible); a slot before it starts from the head.
-		const bool hinted = slot >= claim_hint_chunks * _Size;
+		// A slot in the head's chunk needs no walk and leaves the hint alone. Past it, resume
+		// the walk at the hint (acquire: its publisher acquired the node from its publication,
+		// so its index is visible); a slot before the hint starts from the head.
+		const bool hinted = slot >= _Size;
 		typename Stash_T::Cursor claim;
 		typename Stash_T::Data* hint = nullptr;
 		if (hinted) {
@@ -1051,15 +1044,6 @@ public:
 			stash_out_of_memory_after_claim();
 		}
 		// Nothing after the claim may throw: no trace, no allocation.
-
-		// Move the hint forward to the node this claim resolved, never back.
-		while (hinted && (hint == nullptr || hint->index() < claim.node->index())) {
-			if (atom_claim_hint.compare_exchange_weak(hint, claim.node,
-			        std::memory_order_release, std::memory_order_acquire)) {
-				STASH_CLAIM_HINT_HOOK(true);
-				break;
-			}
-		}
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover
 		// `key`, so a walk can descend to this leaf while the slot is still a
@@ -1087,9 +1071,20 @@ public:
 				value.release();
 			}  // else: unique_ptr frees the value
 		}
-		// No commit step and no extra publish: the FILL's release CAS publishes the
-		// value, and the consumer reads atom_end with an RMW (always fresh) plus each
-		// slot with acquire, so it sees both the reservation and the value.
+
+		// PUBLISH HINT (last, after the fill): the claim of a chunk's first slot stores that
+		// node with release; one store per chunk and none before the fill. A compare-exchange or
+		// a release store before the fill, on the leaf's line that every claim contends, cost
+		// bench_steady's depth-64 p99 5% (stash#1). A delayed publisher can store an older
+		// node, which costs later claims a few hops until the next chunk publishes; a slot
+		// before the hint walks from the head.
+		if (hinted && slot % _Size == 0) {
+			STASH_CLAIM_HINT_HOOK(true);
+			atom_claim_hint.store(claim.node, std::memory_order_release);
+		}
+		// No commit step for the value: the FILL's release CAS publishes it, and the
+		// consumer reads atom_end with an RMW (always fresh) plus each slot with acquire, so it
+		// sees both the reservation and the value.
 	}
 };
 

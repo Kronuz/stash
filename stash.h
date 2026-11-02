@@ -97,7 +97,7 @@ inline T* stash_reserved() noexcept {
 #endif
 
 // Runs for every read (false) and publish (true) of a leaf's claim hint, a no-op unless
-// defined before this header; a test counts that claims in a leaf's head chunk touch neither.
+// defined before this header; a test counts that claims in a leaf's first chunks touch neither.
 #ifndef STASH_CLAIM_HINT_HOOK
 #define STASH_CLAIM_HINT_HOOK(publish)
 #endif
@@ -864,12 +864,17 @@ class StashValues : public Stash<_Tp, _Size, true> {
 	                                 // or drained (null); the walk reads which directly.
 	typename Stash_T::Cursor walk_cursor;    // consumer scan resume points (single
 	typename Stash_T::Cursor clean_cursor;   // consumer; each tracks its own cur)
-	// Producers: a chain node past the head that a claim has resolved, the furthest unless a
-	// race stored an older one last; null means the head. A claim past the head's chunk resumes
-	// its walk there when its slot lies at or past it, so filling a leaf of n values walks O(n)
-	// nodes in all, not O(n^2). A node lives as long as the leaf, and a claim in flight holds its
-	// announce, so the leaf (and the node) outlive every claim that reads the hint.
+	// Producers: the furthest chain node a claim past the first claim_hint_chunks chunks has
+	// resolved. Such a claim resumes its walk there when its slot lies at or past it, so
+	// filling a leaf of n values walks O(n) nodes in all, not O(n^2). A node lives as long as
+	// the leaf, and a claim in flight holds its announce, so the leaf (and the node) outlive
+	// every claim that reads the hint.
 	std::atomic<typename Stash_T::Data*> atom_claim_hint;
+	// Claims into a leaf's first claim_hint_chunks chunks walk from the head (at most seven
+	// hops) and never touch the hint: publishing it, by compare-exchange or by a release store,
+	// on the leaf's line, which every claim contends, cost bench_steady's depth-64 rows (about
+	// 64 values a leaf, chunks of 10) 4% to 12% at p99, more than the hops it saves there.
+	static constexpr size_t claim_hint_chunks = 8;
 
 public:
 	StashValues(StashValues&& o) noexcept
@@ -1018,12 +1023,14 @@ public:
 		L_STASH("StashValues::" + LIGHT_PURPLE + "PUT" + CLEAR_COLOR + " - {}atom_end:{}, op:{}", ctx._col(), atom_end.load(), ctx._op());
 		auto slot = atom_end.fetch_add(1, std::memory_order_relaxed);
 		std::atomic<_Tp*>* ptr_atom_ptr;
-		// A slot in the head's chunk needs no walk and reads no hint. Past it, resume the walk
-		// at the hint (acquire: its publisher acquired the node from its publication, so its
-		// index is visible); a slot before the hint starts from the head.
+		// A slot in the leaf's first claim_hint_chunks chunks walks from the head and leaves
+		// the hint alone. Past them, resume the walk at the furthest node any claim has
+		// resolved (acquire: that claim's thread acquired the node from its publication, so its
+		// index is visible); a slot before it starts from the head.
+		const bool hinted = slot >= claim_hint_chunks * _Size;
 		typename Stash_T::Cursor claim;
 		typename Stash_T::Data* hint = nullptr;
-		if (slot >= _Size) {
+		if (hinted) {
 			STASH_CLAIM_HINT_HOOK(false);
 			hint = atom_claim_hint.load(std::memory_order_acquire);
 			if (hint) {
@@ -1032,7 +1039,11 @@ public:
 			}
 		}
 		try {
-			Stash_T::get(&ptr_atom_ptr, slot, true, claim);
+			if (hinted) {
+				Stash_T::get(&ptr_atom_ptr, slot, true, claim);
+			} else {
+				Stash_T::get(&ptr_atom_ptr, slot, true);
+			}
 		} catch (...) {
 			// A new chunk or chain node failed after the claim: an unfilled claimed
 			// slot is a permanent hole, so fail fast rather than run with one.
@@ -1040,14 +1051,13 @@ public:
 		}
 		// Nothing after the claim may throw: no trace, no allocation.
 
-		// A claim that resolved a node past the hint it read (a null hint is the head) publishes
-		// that node with a store, not a compare-exchange: an RMW here waits for the leaf's line,
-		// which every producer's claim contends. A racing claim may store an older node after a
-		// newer one; that costs later claims a few steps, never a wrong slot (release: a reader
-		// that acquires the node sees its index).
-		if (claim.node->index() > (hint ? hint->index() : 0)) {
-			STASH_CLAIM_HINT_HOOK(true);
-			atom_claim_hint.store(claim.node, std::memory_order_release);
+		// Move the hint forward to the node this claim resolved, never back.
+		while (hinted && (hint == nullptr || hint->index() < claim.node->index())) {
+			if (atom_claim_hint.compare_exchange_weak(hint, claim.node,
+			        std::memory_order_release, std::memory_order_acquire)) {
+				STASH_CLAIM_HINT_HOOK(true);
+				break;
+			}
 		}
 
 		// PUBLISH BOUND (before the fill): widen the valid-key window to cover

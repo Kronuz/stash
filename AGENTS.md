@@ -112,13 +112,15 @@ Breaking one of these produces silent loss or a race, not a compile error.
   refreshed only on such a call; a consumer that carries `begin_key` over from its
   previous walk freezes `first_valid` (no `clean`, and `add` returns `past_horizon` past one span).
   Continuing a walk with further `next` calls is fine.
-- **A leaf's claim hint points into its own chain.** An insert past the head's
-  chunk resumes its hops at `atom_claim_hint` when its slot lies at or past it; a
-  node's `index()` is set before the node is published, and a node is freed only
-  with its leaf. The hint is published with a release store, so a race can move it
-  back (a few extra steps, never a wrong slot); a claim in the head's chunk neither
-  reads nor publishes it. `test_claim_walk` fails if inserts walk from the head
-  again, or if the head's chunk touches the hint.
+- **A leaf's claim hint moves forward only and points into its own chain.** An
+  insert past the leaf's first `claim_hint_chunks` chunks resumes its hops at
+  `atom_claim_hint` when its slot lies at or past it; a node's `index()` is set
+  before the node is published, and a node is freed only with its leaf. Inserts into
+  the first chunks walk from the head and never touch the hint: its compare-exchange
+  (or any release write) on the leaf's contended line cost `bench_steady`'s depth-64
+  p99 more than the hops, and a relaxed write would not order the node's `index()`.
+  `test_claim_walk` fails if inserts walk from the head again, or if the first chunks
+  read or publish the hint.
 - **Pointer-like, non-null values.** The walk's liveness test is `*ptr && **ptr`;
   a null or "zero" value reads as absent.
 

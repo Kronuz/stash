@@ -440,30 +440,32 @@ static void test_alloc_failure() {
 // Inserts into one leaf walk its chain once in all: a claim resumes at the furthest node any claim
 // has reached, so n inserts into a leaf of Size-slot chunks step over about n / Size nodes. From the
 // head each, they would step over n^2 / (2 Size): a backlog of overdue keys, all filed at the floor's
-// leaf, cost quadratic time. Claims in the head's chunk neither read nor publish the hint
-// (bench_steady's depth-64 leaves fill a few chunks, and an atomic on the leaf's line per claim
-// there cost its p99), and one claim publishes each node past the head.
+// leaf, cost quadratic time. Claims in the first 8 chunks (claim_hint_chunks) walk from the head
+// and neither read nor publish the hint (an atomic on the leaf's line per claim there cost
+// bench_steady's depth-64 p99); past them one claim publishes each node.
 static void test_claim_walk() {
 	Wheel wheel;
 	StashContext ctx(0ULL);
 	constexpr int n = 4000;   // 1000 chunks of 4
+	constexpr int first = 8 * 4;   // the slots of the chunks that walk from the head
 	g_chain_steps = g_hint_reads = g_hint_publishes = 0;
 	for (int i = 0; i < n; ++i) {
 		auto r = wheel.add(ctx, 3, std::make_shared<int>(i + 1));
 		assert(r == stash_result::placed);
 		(void)r;
-		if (i == 3 && (g_hint_reads || g_hint_publishes)) {
-			std::fprintf(stderr, "claims in the head's chunk read the hint %llu times and published it %llu times\n", g_hint_reads, g_hint_publishes);
+		if (i == first - 1 && (g_hint_reads || g_hint_publishes)) {
+			std::fprintf(stderr, "claims in the first chunks read the hint %llu times and published it %llu times\n", g_hint_reads, g_hint_publishes);
 			std::abort();
 		}
 	}
-	if (g_chain_steps > n / 4 + 8) {
+	// The first chunks step over 4 * (0 + 1 + ... + 7) = 112 nodes, the rest about one per chunk.
+	if (g_chain_steps > n / 4 + 8 + 112) {
 		std::fprintf(stderr, "%d inserts into one leaf stepped over %llu chain nodes (each walked from the head)\n", n, g_chain_steps);
 		std::abort();
 	}
-	if (g_hint_reads != n - 4 || g_hint_publishes != n / 4 - 1) {
+	if (g_hint_reads != n - first || g_hint_publishes != n / 4 - 8) {
 		std::fprintf(stderr, "%d inserts into one leaf read the hint %llu times (want %d) and published it %llu times (want %d)\n",
-		             n, g_hint_reads, n - 4, g_hint_publishes, n / 4 - 1);
+		             n, g_hint_reads, n - first, g_hint_publishes, n / 4 - 8);
 		std::abort();
 	}
 	std::vector<int> got;

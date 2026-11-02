@@ -74,15 +74,16 @@ computes `chunk_num = slot / _Size` and reduces `slot` to `slot % _Size`, then w
   node. Either way it advances to a valid `next`.
 
 A read-side caller (the walk, `clean`) passes its own cursor and resumes the hops at
-the node it last resolved. An insert into a leaf past its head's chunk resumes at the
-leaf's claim hint (`atom_claim_hint`), a node past the head that a claim into that leaf
-has resolved, with each node carrying its place in the chain (`index()`, fixed before
-the node is published). A claim that resolves a node past the hint it read stores that
-node there (a release store, not a compare-exchange, so no claim waits on the leaf's
-contended line for it); a race can leave an older node, which costs later claims a few
-steps. A claim in the head's chunk neither reads nor stores the hint, and a claim whose
-slot lies before the hint starts from the head. A node lives as long as its leaf, and an
-insert in flight holds its announce, so the leaf outlives every claim that reads its hint.
+the node it last resolved. An insert into a leaf's first eight chunks
+(`claim_hint_chunks`) walks from the head, at most seven hops. An insert past them
+resumes at the leaf's claim hint (`atom_claim_hint`): the furthest node any such claim
+has resolved, moved only forward by compare-exchange, with each node carrying its place
+in the chain (`index()`, fixed before the node is published). A claim whose slot lies
+before the hint starts from the head. A node lives as long as its leaf, and an insert in
+flight holds its announce, so the leaf outlives every claim that reads its hint. The
+first chunks leave the hint alone because publishing it is an ordered write to the
+leaf's line, which every claim contends: on a leaf of about 64 values (`bench_steady` at
+depth 64) it cost the p99 of an insert more than the hops it saved.
 
 Third, chunk allocation. Once on the right node, it loads `atom_chunk`. If the
 chunk is missing and `spawn` is false, it returns `StashState::ChunkEmpty`. If `spawn` is true, it allocates a chunk (null slots, or
@@ -501,8 +502,9 @@ For a wheel of `L` nested slot levels:
 - **Insert** (`add`/`put`) is `O(L)` slot computations plus, in the worst case,
   one chunk/node allocation per untouched level. For the leaf, `O(1)` amortized:
   one fetch-add, and the chain hops from the leaf's claim hint, so filling a leaf
-  with `n` values steps over about `n / Size` nodes in all (a claim that falls
-  behind the hint walks from the head). A `StashSlots` level walks its own chain
+  with `n` values steps over about `n / Size` nodes in all, plus `28 Size` for its
+  first eight chunks, which walk from the head (as does a claim that falls behind
+  the hint). A `StashSlots` level walks its own chain
   from its head, `slot / Size` hops, bounded by `_Mod / Size`.
 - **Walk** visits each non-empty slot at most once per level; with the atomic
   key bounds it skips empty key ranges entirely, so a sparse wheel walks in time

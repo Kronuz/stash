@@ -4,6 +4,8 @@ All notable changes to `stash` are recorded here, newest first. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Earlier changes are recorded
 in [STRAND_FIX.md](STRAND_FIX.md) and `docs/perf/`.
 
+Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#stash) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
+
 ## 2026-11-01
 
 ### Changed

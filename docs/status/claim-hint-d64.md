@@ -14,6 +14,23 @@
 
 ## State
 
+The fallback (b0fce1c, landed as 4187183) does not meet the bar. A second strict hold per
+machine timed it against START and e50bf9a: depth-64 p99 at t=4 / t=14, M4 Pro 0.898 / 1.018
+(stash rows alone 0.938 / 0.943), i9 0.972 / 0.963 (0.961 / 0.942); details in CHANGELOG
+2026-11-01 and stash#1. Its premise was wrong: those leaves hold about 120 values, so 34.6%
+of their inserts still use the hint. Waiting on the lead.
+
+## Done criteria
+
+- `steady D=64 stash t=4 p99` and `t=14 p99` at least as fast as START (2e2b75f) on the M4 Pro
+  and the i9: ratio >= 0.97 and outside the A/A spread, or better.
+- No other row of the four benches more than 3% slower than HEAD (e50bf9a).
+- The chain-walk win kept: `test_claim_walk` at n / 4 steps; the depth-1 024 and 16 384 rows.
+- The concurrent tests clean under TSan; a stress at depth 64 with 14 producers that fails on a
+  lost or duplicated claim.
+
+## State
+
 Fallback landed in place of the fix (issue Kronuz/stash#1): the store-published hint (528ccef) did not reach START on
 the M4 Pro, so a leaf's first eight chunks run START's code again (b0fce1c) and the hint works
 as in 78a18f3 past them. CI green on the branch before landing; GitHub issue filed with the
@@ -56,8 +73,8 @@ findings.
 
 ## Next
 
-- A strict A/B of b0fce1c against START and HEAD on both machines, all four benches, when a
-  hold is free, and the README depth-64 cells from it.
+- The lead decides: a fix that keeps the publish off the claim path for short chains (stash#1
+  lists candidates), a threshold fitted to about 120 values, or the full revert of 78a18f3.
 
 ## Blocked on
 

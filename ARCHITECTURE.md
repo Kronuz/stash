@@ -82,8 +82,11 @@ in the chain (`index()`, fixed before the node is published). A claim whose slot
 before the hint starts from the head. A node lives as long as its leaf, and an insert in
 flight holds its announce, so the leaf outlives every claim that reads its hint. The
 first chunks leave the hint alone because publishing it is an ordered write to the
-leaf's line, which every claim contends: on a leaf of about 64 values (`bench_steady` at
-depth 64) it cost the p99 of an insert more than the hops it saved.
+leaf's line, which every claim contends, and on `bench_steady`'s depth-64 leaves it cost
+the p99 of an insert more than the hops it saved. Those leaves hold about 120 values (a
+finest slot drains whole, so a value waits about half a millisecond), so a third of their
+inserts still pass the first eight chunks and use the hint
+([stash#1](https://github.com/Kronuz/stash/issues/1)).
 
 Third, chunk allocation. Once on the right node, it loads `atom_chunk`. If the
 chunk is missing and `spawn` is false, it returns `StashState::ChunkEmpty`. If `spawn` is true, it allocates a chunk (null slots, or

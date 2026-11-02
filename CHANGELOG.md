@@ -12,14 +12,31 @@ in [STRAND_FIX.md](STRAND_FIX.md) and `docs/perf/`.
   10) walks its chain from the head again, as before 2026-10-31, and neither reads nor
   publishes the claim hint; past them it resumes at the hint as before. The hint had every
   insert read it and every insert that reached a new chunk publish it with a
-  compare-exchange on the leaf's contended line, and `bench_steady`'s depth-64 rows (about
-  64 values a leaf) paid for it at p99. With 4 and 14 producers: 979 and 1 771 ns before
+  compare-exchange on the leaf's contended line, and `bench_steady`'s depth-64 rows paid
+  for it at p99. With 4 and 14 producers: 979 and 1 771 ns before
   the hint, 1 125 and 1 979 ns with it (Apple M4 Pro, 4 rounds); 714 and 1 280 ns before,
   750 and 1 365 ns with it (Intel i9-9980HK, 3 rounds); `bench_steady 250`, both builds
-  interleaved in one strict hold per machine. Those leaves now run the code they ran before
-  the hint; leaves of more values keep the linear walk, `n / Size + 28 Size` nodes for `n`
-  values (`test_claim_walk`: 1 111 steps for 4 000 inserts into chunks of 4, against
-  1 998 000 from the head each). Results and orders are unchanged.
+  interleaved in one strict hold per machine. Leaves of more values keep the linear walk,
+  `n / Size + 28 Size` nodes for `n` values (`test_claim_walk`: 1 111 steps for 4 000
+  inserts into chunks of 4, against 1 998 000 from the head each). Results and orders are
+  unchanged.
+- This does not bring the depth-64 rows back to the code before the hint. Those leaves
+  hold about 120 values, not 64 (a finest slot drains whole, so a value waits about half a
+  millisecond): 34.6% of their inserts land past the first eight chunks and still read and
+  publish the hint (counted through `STASH_CLAIM_HINT_HOOK`, M1 Pro). Measured in a second
+  strict hold per machine (`bench_steady 250`, p99 ns, before the hint and after this
+  change, 4 and 14 producers): Apple M4 Pro 896 to 979.5 (0.898) and 2 270.5 to 2 229.5
+  (1.018), 4 rounds; the stash rows alone, 6 rounds, 958 to 1 020.5 (0.938) and 1 729 to
+  1 833.5 (0.943), where the hint as it was gave 0.938 and 0.922. Intel i9-9980HK 696 to
+  707 (0.972) and 1 259 to 1 303 (0.963), 3 rounds; the stash rows alone, 5 rounds, 0.961
+  and 0.942, the hint as it was 0.962 and 0.920. Against the commit before (e50bf9a), on the
+  rows the hint won: geomeans of `bench_scheduler`, `bench_bursty` and `bench_structures`
+  1.000, 1.003 and 0.983 (M4 Pro) and 1.012, 0.979 and 0.993 (i9); stash rows below 0.97
+  beyond their A/A spread, all on the i9 but one: `structures A-spread stash` t=1 insert
+  0.918, t=4 insert 0.940, t=1 p99 0.946, `B-convergent stash t=1 p99` 0.925,
+  `bursty threads=256 add` p99 0.898 and p999 0.877, `steady D=16384 stash t=1 p99` 0.940,
+  and on the M4 Pro `structures A-spread stash t=8 p99` 0.799 (2 and 3 rounds;
+  [stash#1](https://github.com/Kronuz/stash/issues/1)).
 - The cause, from variants of `bench_steady`'s stash rows in the same holds (p99 ratio
   against the code before the hint, 4 and 14 producers, M4 Pro): the hint as it was,
   0.919 and 0.979; without the compare-exchange on a leaf's first claim, 0.920 and 0.941;

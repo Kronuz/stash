@@ -872,8 +872,9 @@ class StashValues : public Stash<_Tp, _Size, true> {
 	std::atomic<typename Stash_T::Data*> atom_claim_hint;
 	// Claims into a leaf's first claim_hint_chunks chunks walk from the head (at most seven
 	// hops) and never touch the hint: publishing it, by compare-exchange or by a release store,
-	// on the leaf's line, which every claim contends, cost bench_steady's depth-64 rows (about
-	// 64 values a leaf, chunks of 10) 4% to 12% at p99, more than the hops it saves there.
+	// on the leaf's line, which every claim contends, cost bench_steady's depth-64 rows 4% to
+	// 12% at p99. Those leaves hold about 120 values (a finest slot drains whole), so a third of
+	// their claims still land past these chunks; see CHANGELOG 2026-11-01 and stash#1.
 	static constexpr size_t claim_hint_chunks = 8;
 
 public:

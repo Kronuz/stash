@@ -74,12 +74,15 @@ computes `chunk_num = slot / _Size` and reduces `slot` to `slot % _Size`, then w
   node. Either way it advances to a valid `next`.
 
 A read-side caller (the walk, `clean`) passes its own cursor and resumes the hops at
-the node it last resolved. An insert into a leaf resumes at the leaf's claim hint
-(`atom_claim_hint`): the furthest node any claim into that leaf has resolved, moved
-only forward by compare-exchange, with each node carrying its place in the chain
-(`index()`, fixed before the node is published). A claim whose slot lies before the
-hint starts from the head. A node lives as long as its leaf, and an insert in flight
-holds its announce, so the leaf outlives every claim that reads its hint.
+the node it last resolved. An insert into a leaf past its head's chunk resumes at the
+leaf's claim hint (`atom_claim_hint`), a node past the head that a claim into that leaf
+has resolved, with each node carrying its place in the chain (`index()`, fixed before
+the node is published). A claim that resolves a node past the hint it read stores that
+node there (a release store, not a compare-exchange, so no claim waits on the leaf's
+contended line for it); a race can leave an older node, which costs later claims a few
+steps. A claim in the head's chunk neither reads nor stores the hint, and a claim whose
+slot lies before the hint starts from the head. A node lives as long as its leaf, and an
+insert in flight holds its announce, so the leaf outlives every claim that reads its hint.
 
 Third, chunk allocation. Once on the right node, it loads `atom_chunk`. If the
 chunk is missing and `spawn` is false, it returns `StashState::ChunkEmpty`. If `spawn` is true, it allocates a chunk (null slots, or

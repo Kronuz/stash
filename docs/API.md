@@ -37,6 +37,8 @@ trials; ARCHITECTURE.md, "Observing overflow"):
   `std::bad_alloc`.
 - `STASH_CHAIN_STEP_HOOK()` — for every chain node an insert steps over to reach
   its slot's chunk; `test/test.cc` counts them.
+- `STASH_CLAIM_HINT_HOOK(publish)` — for every read (`false`) and publish (`true`)
+  of a leaf's claim hint; `test/test.cc` counts them.
 - `InFlight(ctx, key)` — RAII announce of one insert; `key()` is the key to file
   under. `add` uses it; a caller of `put` that races a walk needs one too.
 - `check(key, limit_key)` — the loop predicate: stops when `key` reaches

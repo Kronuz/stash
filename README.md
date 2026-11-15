@@ -148,6 +148,10 @@ measured variants.
 
 ## 📚 Documentation
 
+- [The Sparse Wheel](https://kronuz.github.io/blog/the-sparse-wheel/):
+  the Familiars post on why it exists and how it works.
+- [Who Owns the Wheel](https://kronuz.github.io/blog/retiring-the-sparse-wheel/):
+  the Familiars post on why `stash` retires and what replaces it.
 - [docs/API.md](docs/API.md): every type and member, and the tracing hooks.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the three templates, traversal, the concurrency
   model and reclamation, limits and fit, and the cost model.
